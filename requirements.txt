@@ -4,3 +4,4 @@ pillow
 numpy<2
 onnxruntime
 opencv-python-headless
+PyPDF2
