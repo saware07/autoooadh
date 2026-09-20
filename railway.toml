@@ -1,3 +1,8 @@
 [build]
 builder = "NIXPACKS"
 buildCommand = "pip install -r requirements.txt"
+
+[deploy]
+startCommand = "python -u aad.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
