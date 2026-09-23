@@ -31,7 +31,7 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ============== CONFIG ==============
-BOT_TOKEN = "8800949076:AAHnyQb6YYbCs98KZyl7uhDfsv2jdHlgFEo"
+BOT_TOKEN = "8849734958:AAH_DrCDkjD6QJSVeSYGH1UGJYatLO0qwFQ"
 OWNER_IDS = {8337013809}
 BOT_NAME = "⚡ Auto-OTP Bot"
 DIVIDER = "━━━━━━━━━━━━━━━"
